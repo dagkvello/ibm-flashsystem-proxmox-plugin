@@ -198,6 +198,176 @@ discarded.
 
 **Still VALIDATE on other firmwares**: field names may differ (unknown
 fields degrade to omissions, so a mismatch shows an empty section, never an
-error). A server-side `alert=yes` filter would shrink the fetch from ~1300
-rows to a handful — worth confirming the REST spelling; the client-side
-split stays either way.
+error).
+
+### Cheaper alerts
+
+`lseventlog` documents dedicated flags for exactly this problem, so the call
+now sends `alert=yes message=no monitoring=no fixed=no` instead of
+`filtervalue=fixed=no`, cutting the payload from the whole unfixed log to the
+alerts alone.
+
+Two failure modes, both handled. A firmware that **rejects** the parameters
+makes the call die, and `_fetch_events` falls back to the known-good
+`fixed=no` form. A firmware that silently **ignores** them is the dangerous
+one — the caller would believe it filtered while holding the full log, and
+would suppress the "N events array-wide" total that describes the
+informational rows it is actually carrying. `_events_view` detects that by
+arithmetic: had the filter applied, every row would be an alert, so a row
+count above the alert count means it did not, and the total is reported after
+all. The client-side alert/informational split remains either way.
+
+## 4. Performance and per-volume consumption
+
+### `{storage}/performance`
+
+A third read-only endpoint, array-wide rather than storage-scoped, feeding a
+Performance section in the Datacenter panel:
+
+```
+GET /nodes/{node}/flashsystem/{storage}/performance
+```
+
+Front-end (`vdisk_*`), back-end (`mdisk_*`) and drive IOPS, bandwidth and
+latency; per-canister CPU, cache and latency; configured throttles; and a
+short front-end history for sparklines. `stat_peak` is the peak over the
+**last five minutes**, which is the reason this is worth showing at all — a
+sample taken as the panel opens misses the spike that made someone open it.
+
+It is a **separate endpoint on its own deadline**, not more sections on
+`overview`, and the panel paints it into its own target. Capacity and
+performance are read at different moments and fail independently; a slow
+statistics call must not be able to delay or starve the pool capacity the
+overview exists to show.
+
+**`lsnodestats` is the primary source, not `lssystemstats`.** The
+system-wide command is documented in the CLI reference but is absent from
+IBM's published REST OpenAPI schema for both 8.7.0 and 9.1.3, while
+`/lsnodestats` is present. It very probably works — but "probably" is not a
+dependency, so the confirmed call is the one that is depended on and
+`lssystemstats` is treated as the optimisation it is. When it fails,
+`_derive_system_stats` rebuilds the same view from the per-node rows:
+throughput summed across canisters, latency and percentages taken from the
+**worst** canister rather than averaged, and the result marked `derived` so
+the panel says where the numbers came from instead of passing an
+approximation off as the array's own figure.
+
+**Latency values are rendered without a unit.** IBM's 8.7 documentation
+contradicts itself on the `*_ms` statistics: the `stat_name` descriptions say
+microseconds, the attribute table reads as milliseconds, and the Performance
+statistics page states the CLI always displays microseconds. Guessing is a
+1000x error in one direction, so the raw value is shown with a note until it
+is compared against the array's own GUI. **VALIDATE**: read `vdisk_ms` and
+check it against the array's volume latency chart at the same moment — on a
+healthy flash array ~0.2–1.0 reads as milliseconds and ~200–1000 as
+microseconds.
+
+**Per-volume performance does not exist and is not implied.** The 8.7 CLI
+reference contains no `ls*` command with per-volume IOPS or latency, the REST
+schemas contain no performance endpoint, and the array's own GUI has no
+per-volume chart either — its Performance tab is system- and node-level,
+drawing the same statistics shown here. The only route is the
+`/dumps/iostats` XML, written once per `startstats` interval (default five
+minutes), retained for ~16 files per node, cumulative since node start, split
+per canister, and reachable over REST only for the config node. That is a
+separate opt-in feature with a timestamp beside every number, not something
+to hide inside an at-a-glance panel.
+
+What the panel offers instead is the honest set of suspects: front-end
+latency next to back-end latency (IBM's own way to separate "the cache or
+host is slow" from "the drives are slow"), per-canister imbalance, and
+`lsthrottle` — a configured cap is the one per-object answer the array gives
+outright, and on an array shared with VMware the system-wide `offload`
+throttle is a realistic culprit.
+
+### Ranked consumption
+
+Both `overview` (per pool) and `health` (per storage) now return a `top`
+block: the largest volumes, a per-guest rollup, and the volumes in the pool
+that this cluster does not manage.
+
+The ranking is computed from the concise `lsvdisk` rows those sections
+**already fetch**, so it adds no array traffic. That constrains what it can
+say, and the constraint is worth stating: the concise view carries no
+`used_capacity` — real usage lives only in the detailed per-volume view. On
+thick volumes that costs nothing, because a fully allocated volume reserves
+its whole size and provisioned *is* consumed. Only space-efficient volumes
+have a fill distinct from their size.
+
+For those, `_collect_fill` makes **one** `lssevdiskcopy` call per pool rather
+than one detailed call per volume. That is not a micro-optimisation: the
+array runs one CLI command at a time cluster-wide, behind a 10 req/s cap and
+four connections, on a box VMware is also driving, and a live `429` has
+already been observed from ordinary pvestatd polling.
+
+The denominator depends on `autoexpand`, and inverting it inverts the
+meaning of the bar. With autoexpand **on**, `real_capacity` grows on demand
+and the fill is `used / provisioned`. With it **off** there is no growth and
+the fill is `used / real_capacity` — reaching 100% there takes the volume
+**offline**. This mirrors IBM's own `-warning` semantics on
+`mkvdisk`/`addvdiskcopy`, and the panel labels which basis it used.
+
+**Data reduction pools report no per-volume fill at all.** IBM documents
+`used_capacity`, `real_capacity` and `free_capacity` as blank for thin and
+compressed copies in a DRP. `_collect_fill` therefore checks
+`lsmdiskgrp`'s `data_reduction` — from the call the pool section already
+makes — and skips the query entirely rather than spending a request to
+learn nothing. The panel then says per-volume fill is not reported for a DRP,
+instead of drawing an empty bar that would read as "this volume is empty".
+Every pmcl01 tier is a DRP, so this is the normal path there, not the edge
+case.
+
+**Volumes this cluster does not manage are counted, and named only with
+audit on the whole storage tree.** On a pool shared with VMware or another
+cluster the largest consumer is frequently not a PVE volume, and a ranking
+that omitted them would point the operator at the wrong tenant. Names are a
+step beyond counts, so they need `Datastore.Audit` on `/storage` rather than
+on one storage; without it the foreign consumers still appear as a count and
+a total.
+
+Attribution prefers a **prefixed** owner. A storage configured without
+`fsprefix` translates pass-through and therefore matches any PVE-shaped name
+in its pool, including volumes that demonstrably belong to a prefixed
+storage sharing it; checking prefixed storages first makes attribution
+deterministic whenever the real owner is knowable.
+
+`fast_write_state=corrupt` is surfaced beside offline volumes rather than
+left in a size ranking — it needs `recovervdisk`/`repairvdiskcopy` and is a
+repair job, not a capacity observation.
+
+**Three buckets, not two, on the storage tab.** `overview` is pool-scoped, so
+every flashsystem storage sharing the pool is legitimately "ours". `health` is
+storage-scoped, and folding its siblings into the foreign bucket made a
+storage blame another tenant for its own cluster's volumes — on a cluster
+where a tier storage and its Kubernetes CSI storage share a pool, that is
+every PVC. `_top_volumes_view` therefore takes a `self` option: with it set, a
+volume owned by another peer becomes a separately labelled `siblings`
+aggregate, counted and sized but never named, since the caller's permission is
+on this storage and not on its siblings.
+
+**Section timeouts are raised as an object, not a string.** `_fetch_events`
+wraps its first call in an `eval` to detect a firmware that rejects the alert
+parameters — and that `eval` also catches the `SIG{ALRM}` die from the
+section deadline. Read as a rejection, a timeout would send the ~1300-row
+fallback with the alarm already spent: nothing armed, LWP's own 30s plus 429
+backoff on top, comfortably past the ~30s proxy cap, holding a pvedaemon
+worker and starving every later section out of the shared budget. The
+deadline therefore dies with a blessed object that callers must re-throw, so
+"the array is hung" is distinguishable from "that call was refused" without
+matching on another sub's message text. When the first call fails *fast*, the
+section alarm is still armed and bounds the fallback with no extra machinery.
+
+**Volumes needing attention render first and unranked.** They are not sorted
+by size and must not depend on making the top ten — a small offline volume in
+a pool of multi-terabyte ones would never surface. `fast_write_state=corrupt`
+matters especially: it arrives *with* `status=online`, so a status column
+alone displays it as healthy when it actually needs `recovervdisk` before the
+guest will start.
+
+**Known gap (inherited).** Both sections filter `lsvdisk` server-side on
+`mdisk_grp_name`, which does not match **mirrored** volumes — those report
+`many`. A mirrored volume is therefore missing from the pool's counts and
+ranking. The fix is to fetch unfiltered and scope client-side on
+`parent_mdisk_grp_name`, at the cost of a cluster-wide result set; it is not
+made here because it changes the pre-existing volume-count behaviour that is
+validated in production.

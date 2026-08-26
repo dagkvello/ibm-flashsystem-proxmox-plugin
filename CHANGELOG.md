@@ -5,6 +5,47 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
 ## Unreleased — 2026-08-26
 
+- **Performance endpoint + Datacenter performance section**:
+  `GET /nodes/{node}/flashsystem/{storage}/performance` returns front-end,
+  back-end and drive IOPS/bandwidth/latency with five-minute peaks,
+  per-canister CPU/cache/latency, configured throttles, and a short
+  front-end history for sparklines. `lsnodestats` is the primary source —
+  `lssystemstats` is absent from IBM's published REST schema for both 8.7.0
+  and 9.1.3, so when it is unreachable the same view is derived from the
+  per-node rows (throughput summed, latency and percentages from the worst
+  canister, flagged `derived`). Separate endpoint on its own deadline so a
+  slow statistics call cannot starve the capacity view. Latency is rendered
+  **without a unit**: IBM's 8.7 docs contradict themselves on whether the
+  `*_ms` statistics are microseconds or milliseconds, and guessing is a
+  1000x error.
+- **Ranked consumption** in both `overview` (per pool) and `health` (per
+  storage): largest volumes, per-guest rollup, and the volumes in the pool
+  this cluster does not manage — computed from the concise `lsvdisk` rows
+  those sections already fetch, so no extra array traffic. The GUI joins
+  VMIDs to VM names from the resource store, and columns are click-sortable.
+- **Per-volume fill in one call**: `lssevdiskcopy` per pool replaces any
+  per-volume fan-out, which matters because the array runs one CLI command
+  at a time cluster-wide behind a 10 req/s cap. The denominator follows
+  `autoexpand` — with it off, 100% of `real_capacity` takes the volume
+  offline. Skipped entirely on data reduction pools, where IBM documents
+  these fields as blank; the panel says so rather than drawing an empty bar.
+- **Cheaper alerts**: `lseventlog` now sends `alert=yes message=no
+  monitoring=no fixed=no` rather than fetching the whole unfixed log, with a
+  fallback when a firmware rejects the parameters and an arithmetic
+  self-check for one that silently ignores them.
+- `fast_write_state=corrupt` surfaced beside offline volumes — it needs
+  `recovervdisk`, and a size ranking is the wrong place to learn that.
+  Attention rows render first and unranked, so a small offline volume in a
+  pool of large ones cannot hide below the top ten.
+- **Three buckets on the storage tab**: a sibling flashsystem storage sharing
+  the pool is counted separately from another tenant. Folding siblings into
+  "foreign" made a tier storage attribute its own cluster's Kubernetes PVCs to
+  the VMware volumes next door.
+- **GUI render tests** (`tests/t_gui.js`, stubbed ExtJS, skipped without node):
+  two defects found in review were renderer-only — data the API computed,
+  returned and unit-tested that nothing ever displayed — which no Perl test
+  can see.
+
 - **Health & capacity API + "FlashSystem" storage tab** (experimental):
   `PVE::API2::FlashSystem` exposes read-only
   `GET /nodes/{node}/flashsystem/{storage}/health` — system identity, pool
