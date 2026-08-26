@@ -70,10 +70,24 @@ my $vols = PVE::API2::FlashSystem::_volumes_view([
     { name => 'pmcl01-vm-1-disk-0',  capacity => '100' },
     { name => 'other-vm-1-disk-0',   capacity => '50'  },   # foreign prefix
     { name => 'pmcl01-vm-2-state-x', capacity => '25'  },
+    { name => 'pmcl01-tierlun-00',   capacity => '999' },   # ours, not a PVE volume
 ], $scfg);
-ok_case('volumes: pool total', $vols->{pool_total}, 3);
+ok_case('volumes: pool total', $vols->{pool_total}, 4);
 ok_case('volumes: ours only', $vols->{ours}, 2);
 ok_case('volumes: ours bytes', $vols->{ours_provisioned}, 125);
+
+# A storage with NO fsprefix: the translation is a pass-through, so the shape
+# test is the only thing keeping other consumers' volumes out of the count.
+# Live 2026-08-26 this reported 6 volumes / 5.6 TB where PVE managed 4 / 103 GB.
+my $noprefix = PVE::API2::FlashSystem::_volumes_view([
+    { name => 'vm-102-disk-0',        capacity => '34359738368' },
+    { name => 'vm-102-state-test',    capacity => '34808528896' },
+    { name => 'pmcl01-vm-196-disk-0', capacity => '34359738368' },   # another storage's
+    { name => 'volume-9f3a-openstack', capacity => '2750000000000' }, # not PVE at all
+], {});
+ok_case('volumes: prefixless PVE shapes only', $noprefix->{ours}, 2);
+ok_case('volumes: prefixless pool total', $noprefix->{pool_total}, 4);
+ok_case('volumes: prefixless bytes', $noprefix->{ours_provisioned}, 69168267264);
 
 # ---- _events_view -------------------------------------------------------------
 # Shapes taken verbatim from a live 8.7.0.3 array (FlashSystem 5200): the

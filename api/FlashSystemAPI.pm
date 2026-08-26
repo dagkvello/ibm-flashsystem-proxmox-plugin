@@ -88,9 +88,17 @@ sub _volumes_view {
     my ($vdisks, $scfg) = @_;
     $vdisks = [] if ref($vdisks) ne 'ARRAY';
     my ($ours, $bytes) = (0, 0);
+    my $shape = qr/\Avm-\d+-$PVE::Storage::Custom::FlashSystemPlugin::VOLNAME_SUFFIX\z/a;
     for my $v (@$vdisks) {
         my $name = PVE::Storage::Custom::FlashSystemPlugin::_volname_from_array($scfg, $v->{name} // '');
         next if !defined $name;
+        # The prefix alone is not enough: list_images ALSO requires the PVE
+        # volume shape, and without that test a storage with no fsprefix —
+        # where the translation is a pass-through — claims every object in
+        # the pool. Observed live 2026-08-26: a prefix-less storage reported
+        # 6 volumes / 5.6 TB while PVE managed 4 / 103 GB, the difference
+        # being another consumer's volumes in a shared pool.
+        next if $name !~ $shape;
         $ours++;
         $bytes += (($v->{capacity} // 0) + 0);
     }
@@ -198,7 +206,14 @@ sub _collect_health {
 
     my $deadline = time() + $TOTAL_BUDGET;
     my $errors = {};
-    my $health = { storage => $storeid, pool_name => $scfg->{fspool} };
+    # fsprefix is reported so the panel can flag its absence: an unprefixed
+    # storage cannot be isolated from other consumers of the same pool, and
+    # the option is fixed after creation.
+    my $health = {
+        storage   => $storeid,
+        pool_name => $scfg->{fspool},
+        prefix    => $scfg->{fsprefix},
+    };
 
     my $sys = _section($errors, 'system', $deadline, 8, sub {
         PVE::Storage::Custom::FlashSystemPlugin::_one(

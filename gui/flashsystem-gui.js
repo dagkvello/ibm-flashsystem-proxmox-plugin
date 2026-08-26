@@ -250,6 +250,13 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
             h.push(row(gettext('This storage'),
                 `${d.volumes.ours} (${me.fmtBytes(d.volumes.ours_provisioned)} ${e(gettext('provisioned'))})`));
             h.push(row(gettext('Whole pool'), `${d.volumes.pool_total}`));
+            // An unprefixed storage shares the pool's namespace with every
+            // other consumer and cannot be isolated from them. fsprefix is
+            // fixed at creation, so this only gets more expensive to fix.
+            h.push(row(gettext('Array name prefix'), d.prefix
+                ? e(d.prefix)
+                : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> '
+                  + e(gettext('none — objects are unprefixed and share the pool namespace'))));
             h.push('</table>');
         }
 
