@@ -343,20 +343,280 @@ Ext.define('PVE.storage.FlashSystemConfigOverride', {
         let me = this;
         try {
             let sel = me.pveSelNode && me.pveSelNode.data ? me.pveSelNode.data : {};
-            if (sel.type === 'storage' && sel.plugintype === 'flashsystem' && Ext.isArray(me.items)) {
-                me.items.push({
-                    xtype: 'pveFlashSystemHealthPanel',
-                    title: 'FlashSystem',
-                    itemId: 'flashsystemhealth',
-                    iconCls: 'fa fa-heartbeat',
-                    nodename: sel.node,
-                    storage: sel.storage,
-                });
+            if (Ext.isArray(me.items)) {
+                if (sel.type === 'storage' && sel.plugintype === 'flashsystem') {
+                    // Per-storage health tab.
+                    me.items.push({
+                        xtype: 'pveFlashSystemHealthPanel',
+                        title: 'FlashSystem',
+                        itemId: 'flashsystemhealth',
+                        iconCls: 'fa fa-heartbeat',
+                        nodename: sel.node,
+                        storage: sel.storage,
+                    });
+                } else if (me.hstateid === 'dctab' || sel.id === 'root') {
+                    // Datacenter-wide overview. This MUST hook PVE.panel.Config
+                    // rather than PVE.dc.Config: the latter assigns me.items = []
+                    // as the first statement of its own initComponent, i.e. after
+                    // an override on it would have run, so the entry would be
+                    // discarded silently.
+                    let caps = Ext.state.Manager.get('GuiCap') || {};
+                    let maySee = (caps.storage
+                            && (caps.storage['Datastore.Audit'] || caps.storage['Datastore.Allocate']))
+                        || (caps.dc && caps.dc['Sys.Audit']);
+                    if (maySee) {
+                        let item = {
+                            xtype: 'pveDcFlashSystemOverview',
+                            title: 'FlashSystem',
+                            itemId: 'flashsystem',
+                            iconCls: 'fa fa-hdd-o',
+                        };
+                        // Sit next to Ceph, where people already look for
+                        // storage-fabric status; then Storage; else append.
+                        let idx = -1;
+                        ['ceph', 'storage'].forEach(function(id) {
+                            if (idx < 0) {
+                                idx = me.items.findIndex(function(it) { return it && it.itemId === id; });
+                            }
+                        });
+                        if (idx >= 0) {
+                            me.items.splice(idx + 1, 0, item);
+                        } else {
+                            me.items.push(item);
+                        }
+                    }
+                }
             }
         } catch (err) {
             // eslint-disable-next-line no-console
-            console.error('flashsystem health tab:', err);
+            console.error('flashsystem config tab:', err);
         }
         me.callParent();
     },
 });
+
+// ---------------------------------------------------------------------------
+// LOCAL PATCH (datacenter overview, see UPSTREAM.md section 3): a "FlashSystem"
+// entry in the Datacenter menu beside Ceph, aggregating every flashsystem
+// storage in the cluster — array identity, per-pool capacity, which storages
+// share each pool, FC ports and unfixed array alerts.
+//
+// Fed by GET /nodes/{node}/flashsystem/{storage}/overview, which de-duplicates
+// server-side: ONE request per array, and the array itself sees each fact
+// fetched once rather than once per storage.
+//
+// The small formatters are duplicated from the health panel on purpose — that
+// panel is validated in production and not worth refactoring for a dozen lines.
+// ---------------------------------------------------------------------------
+
+Ext.define('PVE.dc.FlashSystemOverview', {
+    extend: 'Ext.panel.Panel',
+    alias: 'widget.pveDcFlashSystemOverview',
+
+    scrollable: true,
+    bodyPadding: 15,
+    html: '<div>' + gettext('Loading...') + '</div>',
+
+    tbar: [
+        {
+            text: gettext('Refresh'),
+            iconCls: 'fa fa-refresh',
+            handler: function() {
+                this.up('panel').reload();
+            },
+        },
+    ],
+
+    esc: Ext.htmlEncode,
+
+    fmtBytes: function(v) {
+        if (v === undefined || v === null) { return '-'; }
+        return Proxmox.Utils.format_size(v);
+    },
+
+    fmtEventTime: function(t) {
+        let m = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(String(t || ''));
+        if (!m) { return t || ''; }
+        return `20${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+    },
+
+    // Any online node will do — the endpoint is proxied to it and the data is
+    // array-wide, not node-specific.
+    anyNode: function() {
+        let found;
+        try {
+            PVE.data.ResourceStore.each(function(rec) {
+                if (!found && rec.data.type === 'node' && rec.data.status === 'online') {
+                    found = rec.data.node;
+                }
+                return !found;
+            });
+        } catch (err) {
+            // ignore — fall through to the Proxmox global below
+        }
+        if (!found && typeof Proxmox !== 'undefined' && Proxmox.NodeName
+            && Proxmox.NodeName !== 'localhost') {
+            found = Proxmox.NodeName;
+        }
+        return found;
+    },
+
+    renderArray: function(d) {
+        let me = this;
+        let e = me.esc;
+        let h = [];
+        if (!d || d.error) {
+            // d.error is response.htmlStatus, already encoded by the toolkit.
+            return '<div style="color:#c0392b;margin-bottom:18px;">'
+                + ((d && d.error) || e(gettext('Query failed'))) + '</div>';
+        }
+        let sys = d.system || {};
+
+        h.push('<div style="margin-bottom:22px;">');
+        h.push(`<h2 style="margin:0 0 2px;font-size:16px;">${e(sys.name || d.array || 'FlashSystem')}</h2>`);
+        let sub = [];
+        if (sys.product_name) { sub.push(e(sys.product_name)); }
+        if (sys.code_level) { sub.push(e(gettext('Firmware')) + ' ' + e(sys.code_level)); }
+        if (d.array) { sub.push(e(d.array)); }
+        h.push(`<div style="color:#888;margin-bottom:12px;">${sub.join(' &middot; ')}</div>`);
+
+        // ports + alerts, one line each — array-wide facts
+        if (d.ports) {
+            let ok = d.ports.active === d.ports.total;
+            h.push(`<div style="margin-bottom:4px;">`
+                + (ok ? '<i class="fa fa-check" style="color:#2d7d46;"></i> '
+                      : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> ')
+                + `${d.ports.active} / ${d.ports.total} ${e(gettext('FC ports active'))}</div>`);
+        }
+        if (d.events) {
+            let alerts = d.events.alerts || 0;
+            h.push('<div style="margin-bottom:10px;">'
+                + (alerts === 0
+                    ? '<i class="fa fa-check" style="color:#2d7d46;"></i> ' + e(gettext('No unfixed alerts'))
+                    : `<i class="fa fa-exclamation-triangle" style="color:#c0392b;"></i> <b>${alerts}</b> ${e(gettext('unfixed alerts'))}`)
+                + ` <span style="color:#888;">(${d.events.unfixed_total || 0} ${e(gettext('events array-wide, incl. informational'))})</span></div>`);
+            (d.events.recent || []).forEach(function(ev) {
+                h.push('<div style="font-size:12px;color:#888;margin-left:18px;">'
+                    + `${e(me.fmtEventTime(ev.last_timestamp))} &nbsp; <b>${e(ev.error_code || '')}</b> `
+                    + `${e(ev.description || '')}`
+                    + (ev.object_name ? ` (${e(ev.object_name)})` : '') + '</div>');
+            });
+        }
+
+        // one card per pool, listing the storages that share it
+        (d.pools || []).forEach(function(p) {
+            let c = p.capacity || {};
+            let known = c.provision_total !== undefined;
+            let pct = known ? (c.provision_used_pct || 0) : 0;
+            let color = pct >= 90 ? '#c0392b' : (pct >= 75 ? '#c87f0a' : '#2d7d46');
+            h.push('<div style="margin-top:16px;padding:10px 12px;border:1px solid #444;border-radius:4px;">');
+            h.push(`<div style="display:flex;justify-content:space-between;margin-bottom:6px;">`
+                + `<b>${e(p.pool || '')}</b>`
+                + `<span style="color:#888;">`
+                + (known ? `${pct}% ${e(gettext('of physical'))}` : e(gettext('unavailable')))
+                + (c.data_reduction === 'yes' ? ' &middot; ' + e(gettext('data reduction')) : '')
+                + `</span></div>`);
+            h.push(`<div style="max-width:520px;background:#2a2a2a;border:1px solid #555;border-radius:3px;height:14px;">`
+                + `<div style="background:${color};width:${Math.min(pct, 100)}%;height:100%;border-radius:2px;"></div></div>`);
+            h.push(`<div style="color:#888;font-size:12px;margin:4px 0 8px;">`
+                + (c.provision_total === undefined
+                    ? '<i class="fa fa-question-circle"></i> ' + e(gettext('capacity unavailable'))
+                    : `${me.fmtBytes(c.provision_used)} / ${me.fmtBytes(c.provision_total)} `
+                      + `(${me.fmtBytes(c.provision_free)} ${e(gettext('free'))})`)
+                + ' &middot; '
+                + (p.pool_volumes === undefined
+                    ? e(gettext('volume count unavailable'))
+                    : `${p.pool_volumes} ${e(gettext('volumes in pool'))}`)
+                + '</div>');
+            h.push('<table style="font-size:12px;width:100%;">');
+            (p.storages || []).forEach(function(s) {
+                h.push('<tr>'
+                    + `<td style="padding:1px 12px 1px 0;"><b>${e(s.storage)}</b></td>`
+                    + `<td style="padding:1px 12px 1px 0;color:#888;">`
+                        + (s.prefix ? e(s.prefix)
+                            : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> ' + e(gettext('no prefix')))
+                    + '</td>'
+                    + `<td style="padding:1px 12px 1px 0;">`
+                        + (s.volumes === undefined ? '&ndash;' : `${Number(s.volumes) || 0} ${e(gettext('vols'))}`)
+                    + '</td>'
+                    + `<td style="padding:1px 12px 1px 0;">`
+                        + (s.provisioned === undefined ? '&ndash;' : me.fmtBytes(s.provisioned))
+                    + '</td>'
+                    + `<td style="padding:1px 0;color:#888;">`
+                        + (s.thin ? e(gettext('thin')) : e(gettext('thick')))
+                        + (s.snapshots ? ' &middot; ' + e(gettext('snapshots')) : '')
+                    + '</td></tr>');
+            });
+            h.push('</table></div>');
+        });
+
+        if (d.errors) {
+            h.push(`<div style="margin-top:10px;font-size:12px;color:#c87f0a;">`
+                + e(gettext('Sections unavailable')) + ': '
+                + e(Object.keys(d.errors).join(', ')) + '</div>');
+        }
+        h.push('</div>');
+        return h.join('');
+    },
+
+    reload: function() {
+        let me = this;
+        let node = me.anyNode();
+        if (!node) {
+            me.update('<div>' + gettext('No online node found.') + '</div>');
+            return;
+        }
+        Proxmox.Utils.API2Request({
+            url: `/nodes/${node}/flashsystem`,
+            method: 'GET',
+            waitMsgTarget: me,
+            failure: function(response) {
+                me.update('<div style="color:#c0392b;">'
+                    + (response.htmlStatus || Ext.htmlEncode(gettext('Query failed'))) + '</div>');
+            },
+            success: function(response) {
+                let list = response.result.data || [];
+                if (!list.length) {
+                    me.update('<div>' + gettext('No FlashSystem storages are configured.') + '</div>');
+                    return;
+                }
+                // One representative storage per array: the overview is
+                // array-wide, so querying every storage would repeat itself.
+                let seen = Object.create(null);
+                let reps = [];
+                list.forEach(function(s) {
+                    let key = s.address || '_';
+                    if (!seen[key]) { seen[key] = true; reps.push(s.storage); }
+                });
+                // NB: Proxmox.Utils.API2Request invokes `callback` BEFORE
+                // success/failure, so counting down there renders with the
+                // data still unassigned — on a single-array cluster that is a
+                // permanently blank panel. Count down inside both handlers.
+                let out = [];
+                let pending = reps.length;
+                let done = function() {
+                    pending--;
+                    if (pending > 0) { return; }
+                    // Map over reps, not out: a sparse array would silently
+                    // drop an entry rather than showing its error.
+                    me.update(reps.map(function(_, i) { return me.renderArray(out[i]); }).join(''));
+                };
+                reps.forEach(function(st, i) {
+                    Proxmox.Utils.API2Request({
+                        url: `/nodes/${node}/flashsystem/${encodeURIComponent(st)}/overview`,
+                        method: 'GET',
+                        success: function(r) { out[i] = r.result.data; done(); },
+                        failure: function(r) { out[i] = { error: r.htmlStatus }; done(); },
+                    });
+                });
+            },
+        });
+    },
+
+    listeners: {
+        activate: function() {
+            this.reload();
+        },
+    },
+});
+

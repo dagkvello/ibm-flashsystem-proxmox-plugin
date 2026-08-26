@@ -5,7 +5,8 @@ package PVE::API2::FlashSystem;
 #
 #   GET /nodes/{node}/flashsystem                      -> flashsystem storages
 #   GET /nodes/{node}/flashsystem/{storage}            -> ['health']
-#   GET /nodes/{node}/flashsystem/{storage}/health     -> aggregate (below)
+#   GET /nodes/{node}/flashsystem/{storage}/health     -> one storage
+#   GET /nodes/{node}/flashsystem/{storage}/overview   -> the whole array
 #
 # Proxmox has no API plugin registry, so this module is registered by
 # appending a marker-wrapped block to PVE/API2/Nodes.pm — see
@@ -50,8 +51,6 @@ BEGIN {
 }
 
 use base qw(PVE::RESTHandler);
-
-my $FS = 'PVE::Storage::Custom::FlashSystemPlugin';
 
 # ---- pure view helpers (unit-tested in tests/t_api.pl) --------------------
 
@@ -278,6 +277,7 @@ __PACKAGE__->register_method({
             properties => {
                 storage => { type => 'string' },
                 pool    => { type => 'string', optional => 1 },
+                address => { type => 'string', optional => 1 },
             },
         },
         links => [ { rel => 'child', href => '{storage}' } ],
@@ -294,7 +294,11 @@ __PACKAGE__->register_method({
             next if ($scfg->{type} // '') ne 'flashsystem';
             next if !$rpcenv->check_any($authuser, "/storage/$storeid",
                 [ 'Datastore.Audit', 'Datastore.Allocate' ], 1);
-            push @$res, { storage => $storeid, pool => $scfg->{fspool} };
+            push @$res, {
+                storage => $storeid,
+                pool    => $scfg->{fspool},
+                address => $scfg->{fsaddress},
+            };
         }
         return $res;
     },
@@ -322,7 +326,7 @@ __PACKAGE__->register_method({
         links => [ { rel => 'child', href => '{subdir}' } ],
     },
     code => sub {
-        return [ { subdir => 'health' } ];
+        return [ { subdir => 'health' }, { subdir => 'overview' } ];
     },
 });
 
@@ -356,6 +360,136 @@ __PACKAGE__->register_method({
         die "storage '$param->{storage}' is not a flashsystem storage\n"
             if ($scfg->{type} // '') ne 'flashsystem';
         return _collect_health($param->{storage}, $scfg);
+    },
+});
+
+
+# ---- datacenter-wide overview ---------------------------------------------
+
+# Short aliases: everything below talks to the array through the storage
+# plugin's transport (429 retry, token cache).
+sub _fscmd { return PVE::Storage::Custom::FlashSystemPlugin::_cmd(@_); }
+sub _fsone { return PVE::Storage::Custom::FlashSystemPlugin::_one(@_); }
+
+# Aggregate every flashsystem storage sharing one array. The array-wide facts
+# (identity, ports, alerts) are fetched ONCE and each pool ONCE, however many
+# storages use it — an 8-storage / 4-pool cluster costs 11 REST calls rather
+# than the 40 a per-storage fan-out would. Same shared deadline as health(),
+# so a slow array degrades to partial data instead of a proxy timeout.
+#
+# @peers is [[storeid, scfg], ...], already filtered by the caller for read
+# permission: the overview must not leak storages the user cannot audit.
+sub _collect_overview {
+    my ($storeid, $scfg, $peers) = @_;
+
+    my $deadline = time() + $TOTAL_BUDGET;
+    my $errors = {};
+    my $out = { array => $scfg->{fsaddress}, pools => [] };
+
+    my $sys = _section($errors, 'system', $deadline, 8, sub {
+        _fsone(_fscmd($scfg, 'lssystem', undef, {}, storeid => $storeid));
+    });
+    $out->{system} = _system_view($sys) if $sys;
+
+    my $events = _section($errors, 'events', $deadline, 8, sub {
+        _fscmd($scfg, 'lseventlog', undef, { filtervalue => 'fixed=no' }, storeid => $storeid);
+    });
+    $out->{events} = _events_view($events // []) if !exists $errors->{events};
+
+    my $ports = _section($errors, 'ports', $deadline, 8, sub {
+        _fscmd($scfg, 'lsportfc', undef, {}, storeid => $storeid);
+    });
+    $out->{ports} = _ports_view($ports // []) if !exists $errors->{ports};
+
+    my %by_pool;
+    for my $p (@$peers) {
+        push @{ $by_pool{ $p->[1]->{fspool} // '' } }, $p;
+    }
+
+    for my $pool (sort keys %by_pool) {
+        my $entry = { pool => $pool, storages => [] };
+
+        my $g = _section($errors, "pool:$pool", $deadline, 6, sub {
+            _fsone(_fscmd($scfg, 'lsmdiskgrp', $pool, { bytes => JSON::true }, storeid => $storeid));
+        });
+        $entry->{capacity} = _pool_view($g) if $g;
+
+        my $vdisks = _section($errors, "volumes:$pool", $deadline, 8, sub {
+            _fscmd($scfg, 'lsvdisk', undef,
+                { filtervalue => "mdisk_grp_name=$pool", bytes => JSON::true },
+                storeid => $storeid);
+        });
+        # A failed or skipped lsvdisk must NOT publish zeros: "0 volumes"
+        # beside real capacity reads as an empty pool, not as missing data.
+        # Same rule _collect_health applies to its own list sections.
+        my $vol_ok = !exists $errors->{"volumes:$pool"};
+        $entry->{pool_volumes} = scalar(@{ $vdisks // [] }) if $vol_ok;
+
+        # One lsvdisk per pool, counted per storage by each storage's prefix.
+        for my $p (@{ $by_pool{$pool} }) {
+            my ($id, $s) = @$p;
+            my $row = {
+                storage   => $id,
+                prefix    => $s->{fsprefix},
+                thin      => ($s->{fsthin}      ? 1 : 0),
+                snapshots => ($s->{fssnapshots} ? 1 : 0),
+            };
+            if ($vol_ok) {
+                my $v = _volumes_view($vdisks // [], $s);
+                $row->{volumes}     = $v->{ours};
+                $row->{provisioned} = $v->{ours_provisioned};
+            }
+            push @{ $entry->{storages} }, $row;
+        }
+        push @{ $out->{pools} }, $entry;
+    }
+
+    $out->{errors} = $errors if %$errors;
+    return $out;
+}
+
+__PACKAGE__->register_method({
+    name => 'overview',
+    path => '{storage}/overview',
+    method => 'GET',
+    description => "Array-wide overview for every flashsystem storage sharing "
+        . "this storage's array: system identity, per-pool capacity, the storages "
+        . "using each pool, FC port state and unfixed array alerts. Read-only. "
+        . "Array facts and each pool are fetched once regardless of how many "
+        . "storages share them.",
+    protected => 1,
+    proxyto => 'node',
+    permissions => {
+        check => [ 'perm', '/storage/{storage}', [ 'Datastore.Audit', 'Datastore.Allocate' ], any => 1 ],
+    },
+    parameters => {
+        additionalProperties => 0,
+        properties => {
+            node    => get_standard_option('pve-node'),
+            storage => get_standard_option('pve-storage-id'),
+        },
+    },
+    returns => { type => 'object' },
+    code => sub {
+        my ($param) = @_;
+        my $rpcenv = PVE::RPCEnvironment::get();
+        my $authuser = $rpcenv->get_user();
+        my $cfg = PVE::Storage::config();
+        my $scfg = PVE::Storage::storage_config($cfg, $param->{storage});
+        die "storage '$param->{storage}' is not a flashsystem storage\n"
+            if ($scfg->{type} // '') ne 'flashsystem';
+
+        my $addr = $scfg->{fsaddress} // '';
+        my $peers = [];
+        for my $id (sort keys %{ $cfg->{ids} // {} }) {
+            my $s = $cfg->{ids}->{$id};
+            next if ($s->{type} // '') ne 'flashsystem';
+            next if ($s->{fsaddress} // '') ne $addr;
+            next if !$rpcenv->check_any($authuser, "/storage/$id",
+                [ 'Datastore.Audit', 'Datastore.Allocate' ], 1);
+            push @$peers, [ $id, $s ];
+        }
+        return _collect_overview($param->{storage}, $scfg, $peers);
     },
 });
 

@@ -169,6 +169,33 @@ view therefore splits `alerts` (events carrying a non-zero error code) from
 `alerts` is zero. `lseventlog` is a **system** log, so these are array-wide
 — every storage on one array reports the same alerts.
 
+### Datacenter overview
+
+A second entry, **Datacenter -> FlashSystem** (beside Ceph), served by
+`GET /nodes/{node}/flashsystem/{storage}/overview`: the same array facts plus
+every pool in use on that array and which storages share each one, with their
+prefix, thin/thick mode and volume counts.
+
+The endpoint de-duplicates **server-side** — array identity, FC ports and
+alerts fetched once, and each pool fetched once however many storages use it.
+An 8-storage / 4-pool cluster therefore costs 11 REST calls rather than the 40
+a per-storage fan-out would, and the panel issues one HTTP request per array.
+That matters because this is a human-triggered burst against the same rate
+limiter that already produced a live `429` (see the 2026-08-18 entry in
+CHANGELOG.md). `index` gained an `address` field so the panel can group
+storages by array without extra calls.
+
+Peers are permission-filtered: the overview never reports a storage the caller
+cannot audit, and a pool whose storages were all filtered out does not appear.
+Sections that fail or run out of budget **omit** their fields rather than
+reporting zeros — "0 volumes" beside a real capacity bar would read as an
+empty pool instead of a failed query.
+
+The menu entry mounts by overriding `PVE.panel.Config`, not `PVE.dc.Config`:
+the latter assigns `me.items = []` as the first statement of its own
+initComponent, so an override on it runs too early and the entry is silently
+discarded.
+
 **Still VALIDATE on other firmwares**: field names may differ (unknown
 fields degrade to omissions, so a mismatch shows an empty section, never an
 error). A server-side `alert=yes` filter would shrink the fetch from ~1300

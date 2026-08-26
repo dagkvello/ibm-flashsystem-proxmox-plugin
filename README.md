@@ -36,9 +36,9 @@ snapshot-as-block-device, cross-VM volume reassignment via
 
 ```
 FlashSystemPlugin.pm            the storage plugin
-gui/flashsystem-gui.js          Add/Edit dialogs + the FlashSystem health tab
+gui/flashsystem-gui.js          Add/Edit dialogs, the health tab, the DC overview
 gui/install-flashsystem-gui.sh  installs the GUI extension + APT re-apply hook
-api/FlashSystemAPI.pm           read-only health & capacity API (PVE::API2::FlashSystem)
+api/FlashSystemAPI.pm           read-only health & capacity API + array-wide overview
 api/install-flashsystem-api.sh  registers the API into the PVE tree + APT re-apply hook
 tests/                          unit tests — run anywhere perl exists, no array needed
 ```
@@ -90,17 +90,25 @@ systemctl restart pvedaemon pvestatd pveproxy
 # 2. the GUI dialogs (every node)
 cd gui && ./install-flashsystem-gui.sh
 
-# 3. the health API + FlashSystem tab (every node, optional but recommended)
+# 3. the health API (every node) - REQUIRED by the GUI panels from step 2
 cd ../api && ./install-flashsystem-api.sh
 ```
 
-The health tab (storage view → FlashSystem) shows array identity, pool
-capacity (physical and effective), volume counts, unfixed events and FC port
-state — read-only, requires `Datastore.Audit` (or `Datastore.Allocate`), and each section degrades
-independently if the array is slow. CLI equivalent:
+Two views, both read-only and both needing `Datastore.Audit` (or
+`Datastore.Allocate`):
+
+* **Storage view → FlashSystem** — one storage: array identity, pool capacity
+  (physical and effective), volume counts, unfixed alerts, FC port state.
+* **Datacenter → FlashSystem** — the whole array: every pool in use and which
+  storages share each one, with prefix, thin/thick and volume counts. One
+  request per array, de-duplicated server-side.
+
+Each section degrades independently if the array is slow, and a section that
+fails omits its numbers rather than reporting zeros. CLI equivalents:
 
 ```sh
 pvesh get /nodes/$(hostname)/flashsystem/<storage>/health
+pvesh get /nodes/$(hostname)/flashsystem/<storage>/overview
 ```
 
 **After installing or updating the GUI extension, restart the browser as a
@@ -193,7 +201,10 @@ allocation; convert online array-side with `addvdiskcopy -autodelete`.
   pool status per (array, pool) within each pvestatd cycle, so storages
   sharing a pool cost one query and a down array is probed once per cycle,
   not once per storage. `status()` is also hard-bounded — a slow array
-  reports inactive instead of stalling pvestatd.
+  reports inactive instead of stalling pvestatd. The datacenter overview
+  de-duplicates for the same reason: it is a human-triggered burst against
+  the same limiter, so array facts and each pool are fetched once per
+  request rather than once per storage.
 - **Volume protection windows are surfaced, not hidden.** Deleting or
   unmapping a recently written volume fails with `CMMVC8478E`/`CMMVC8957E`
   until the array's protection period passes. The plugin fails loudly on
@@ -216,11 +227,14 @@ tests/run.sh
 ```
 
 Syntax-checks the module against stubbed PVE modules and runs the unit
-suites: prefix translation and cross-tenant isolation, capacity preference
+suites (`t_prefix.pl`, `t_status.pl`, `t_names.pl`, `t_api.pl`): prefix
+translation and cross-tenant isolation, capacity preference
 (physical vs effective, with real `lsmdiskgrp -bytes` fixtures), the volume
 name grammar and 63-char gate (including verified regex-bypass regressions:
 trailing newlines, Unicode digit/word lookalikes), status caching, and the
-thin-provisioning parameter shape. No array needed.
+thin-provisioning parameter shape, the API's registered surface and view
+helpers, and the overview's degradation behaviour (a failed section must omit
+its fields, never report zeros). No array needed.
 
 ## Security notes
 

@@ -17,6 +17,14 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
   error code) and total unfixed: the raw `fixed=no` count is dominated by
   informational chatter (1317 events on the validation array, one of them
   actionable), which would otherwise bury a real pool-space warning.
+- **Datacenter overview**: a "FlashSystem" entry in the Datacenter menu
+  beside Ceph, served by `GET /nodes/{node}/flashsystem/{storage}/overview` —
+  every pool on the array and which storages share each one, with prefix,
+  thin/thick and volume counts. De-duplicated server-side: array facts once,
+  each pool once, so an 8-storage / 4-pool cluster costs 11 REST calls instead
+  of 40 and the panel makes one request per array. `index` gained `address`
+  for grouping. Peers are permission-filtered, and failed sections omit their
+  fields rather than reporting zeros.
 - **Thin provisioning** (`fsthin`): opt-in `mkvdisk -rsize 2% -autoexpand
   -warning 80%` for new volumes, with a matching GUI checkbox. Off by
   default; bare mkvdisk volumes are fully allocated (confirmed via

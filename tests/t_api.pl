@@ -34,7 +34,8 @@ sub ok_case {
 
 # ---- registered API surface -------------------------------------------------
 my $reg = PVE::RESTHandler::registered($M);
-ok_case('methods registered', scalar(@$reg), 3);
+ok_case('registered method set',
+    join(',', sort map { $_->{name} } @$reg), 'diridx,health,index,overview');
 my ($health) = grep { $_->{name} eq 'health' } @$reg;
 ok_case('health exists', ($health ? 'yes' : 'no'), 'yes');
 # protected: the handler reads root-only /etc/pve/priv — must run in pvedaemon.
@@ -154,6 +155,71 @@ my $sv = PVE::API2::FlashSystem::_system_view(
     { name => 'demo', code_level => '8.7.0.0', console_IP => '192.0.2.1:443' });
 ok_case('system: name kept', $sv->{name}, 'demo');
 ok_case('system: IPs dropped', (exists $sv->{console_IP} ? 'yes' : 'no'), 'no');
+
+# ---- overview: registered surface + peer/pool grouping ----------------------
+# The datacenter panel calls ONE overview per array. Its value is the
+# de-duplication: array facts once, each pool once, however many storages
+# share it. Here we assert the registered method and the shape of the
+# per-pool storage breakdown (the REST fan-out itself needs an array).
+my ($ov) = grep { $_->{name} eq 'overview' } @$reg;
+ok_case('overview registered', ($ov ? 'yes' : 'no'), 'yes');
+ok_case('overview is protected', ($ov && $ov->{protected} ? 1 : 0), 1);
+ok_case('overview path', ($ov && $ov->{path} // ''), '{storage}/overview');
+ok_case('overview has perm check',
+    ($ov && $ov->{permissions} && $ov->{permissions}->{check} ? 'yes' : 'no'), 'yes');
+
+# index must expose the array address, or the panel cannot group by array
+# and would issue one overview request per storage instead of per array.
+my ($ix) = grep { $_->{name} eq 'index' } @$reg;
+ok_case('index returns address',
+    ($ix && $ix->{returns}{items}{properties}{address} ? 'yes' : 'no'), 'yes');
+
+# Two storages sharing one pool, counted from a SINGLE lsvdisk result by
+# each storage's own prefix — the saving the endpoint exists for.
+my $shared = [
+    { name => 'pmcl01_Gold-vm-1-disk-0', capacity => '100' },
+    { name => 'k8sg-vm-9999-pvc-abc',    capacity => '50'  },
+    { name => 'foreign-vm-1-disk-0',     capacity => '999' },
+];
+my $tier = PVE::API2::FlashSystem::_volumes_view($shared, { fsprefix => 'pmcl01_Gold' });
+my $k8s  = PVE::API2::FlashSystem::_volumes_view($shared, { fsprefix => 'k8sg' });
+ok_case('overview: tier storage sees its own', $tier->{ours}, 1);
+ok_case('overview: k8s storage sees its own', $k8s->{ours}, 1);
+ok_case('overview: neither sees the foreign one',
+    ($tier->{ours} + $k8s->{ours} + 1), scalar(@$shared));
+
+# ---- overview degradation: a failed section must never publish zeros --------
+# The whole point of the panel is capacity truth. "0 volumes in pool" beside a
+# real capacity bar reads as an empty pool, not as a failed query — so a
+# section that errored must omit its fields, not zero them.
+{
+    no warnings 'redefine';
+    local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+        my ($scfg, $command) = @_;
+        die "lsvdisk exploded\n" if $command eq 'lsvdisk';
+        return [] if $command eq 'lseventlog' || $command eq 'lsportfc';
+        return { name => 'demo', code_level => '8.7.0.3' } if $command eq 'lssystem';
+        return {
+            name => 'P1', status => 'online',
+            capacity => '100', free_capacity => '40',
+            physical_capacity => '100', physical_free_capacity => '40',
+        };
+    };
+    my $degraded = PVE::API2::FlashSystem::_collect_overview(
+        'S', { fsaddress => 'a', fspool => 'P1' },
+        [ [ 'S', { fsaddress => 'a', fspool => 'P1', fsprefix => 'p' } ] ]);
+    my $pool = $degraded->{pools}[0];
+    ok_case('degrade: volume count omitted',
+        (exists $pool->{pool_volumes} ? 'reported-as-zero' : 'omitted'), 'omitted');
+    ok_case('degrade: storage volumes omitted',
+        (exists $pool->{storages}[0]{volumes} ? 'reported-as-zero' : 'omitted'), 'omitted');
+    ok_case('degrade: storage identity kept',
+        $pool->{storages}[0]{prefix}, 'p');
+    ok_case('degrade: capacity still reported',
+        ($pool->{capacity} && $pool->{capacity}{provision_total} ? 'yes' : 'no'), 'yes');
+    ok_case('degrade: failure recorded',
+        (exists $degraded->{errors}{'volumes:P1'} ? 'yes' : 'no'), 'yes');
+}
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall api cases pass\n";
 exit($fail ? 1 : 0);

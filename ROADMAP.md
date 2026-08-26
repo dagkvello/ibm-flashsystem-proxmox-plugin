@@ -5,13 +5,19 @@ agreed approach; the rest are open.
 
 ## 1. Health & capacity overview in the PVE GUI — SHIPPED (experimental)
 
-Landed as `api/FlashSystemAPI.pm` + the "FlashSystem" storage tab (see
-UPSTREAM.md section 3). Still open within this item:
+Landed as `api/FlashSystemAPI.pm` + the "FlashSystem" storage tab + the
+Datacenter -> FlashSystem panel (`{storage}/overview`), see UPSTREAM.md
+section 3. Still open within this item:
 
 - **Field validation across firmwares**: the events/ports sections use
   whitelist extraction, so unknown field names degrade to empty sections —
-  they need confirming per firmware (8.7 pending demo validation; 9.x
-  unknown).
+  they need confirming per firmware (8.7 confirmed on 8.7.0.3; 9.x unknown).
+- **The datacenter panel is not yet validated on hardware** — the storage tab
+  is (8.7.0.3), the datacenter view has only unit coverage.
+- **Event fetch cost**: the overview pulls the full unfixed event log (~1300
+  rows on the validation array) per array on every panel load and Refresh, on
+  top of pvestatd. A server-side `alert=yes` filter would cut it to a handful
+  — confirm the REST spelling.
 - **More sections once validated**: `lsenclosurebattery`, drive summary,
   reduction-savings figures, per-volume throttle visibility.
 - **Complementary path**: a small Prometheus exporter for shops that already
