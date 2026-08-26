@@ -197,6 +197,13 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
 
     esc: Ext.htmlEncode,
 
+    // Storage Virtualize event timestamps are YYMMDDHHMMSS.
+    fmtEventTime: function(t) {
+        let m = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(String(t || ''));
+        if (!m) { return t || ''; }
+        return `20${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`;
+    },
+
     renderHealth: function(d) {
         let me = this;
         let e = me.esc;
@@ -254,12 +261,22 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
         }
 
         if (d.events) {
-            h.push(head(gettext('Unfixed events') + `: ${d.events.unfixed}`));
-            if (d.events.unfixed > 0 && d.events.recent && d.events.recent.length) {
-                h.push('<table style="font-size:12px;">');
+            // Alerts only. The array's unfixed log is mostly informational
+            // chatter (copy-format notices, SAS discovery) — showing that raw
+            // count would bury a real pool-space warning under four figures.
+            let alerts = d.events.alerts || 0;
+            let total = d.events.unfixed_total || 0;
+            h.push(head(gettext('Array alerts')));
+            h.push('<div>'
+                + (alerts === 0
+                    ? '<i class="fa fa-check" style="color:#2d7d46;"></i> ' + e(gettext('No unfixed alerts'))
+                    : `<i class="fa fa-exclamation-triangle" style="color:#c0392b;"></i> <b>${alerts}</b> ${e(gettext('unfixed'))}`)
+                + ` <span style="color:#888;">(${total} ${e(gettext('unfixed events array-wide, incl. informational'))})</span></div>`);
+            if (alerts > 0 && d.events.recent && d.events.recent.length) {
+                h.push('<table style="font-size:12px;margin-top:6px;">');
                 d.events.recent.forEach(ev => {
-                    h.push(row(ev.last_timestamp || ev.sequence_number || '',
-                        `${e(ev.error_code || '')} ${e(ev.description || '')}`
+                    h.push(row(me.fmtEventTime(ev.last_timestamp) || ev.sequence_number || '',
+                        `<b>${e(ev.error_code || '')}</b> ${e(ev.description || '')}`
                         + (ev.object_name ? ` <span style="color:#888;">(${e(ev.object_name)})</span>` : '')));
                 });
                 h.push('</table>');

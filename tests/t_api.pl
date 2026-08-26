@@ -76,16 +76,47 @@ ok_case('volumes: ours only', $vols->{ours}, 2);
 ok_case('volumes: ours bytes', $vols->{ours_provisioned}, 125);
 
 # ---- _events_view -------------------------------------------------------------
+# Shapes taken verbatim from a live 8.7.0.3 array (FlashSystem 5200): the
+# `fixed=no` query returned 1317 rows, of which exactly one carried an error
+# code. Informational rows have error_code "" — they must be counted but
+# never listed, or a real pool-space warning hides behind copy-format noise.
 my $ev = PVE::API2::FlashSystem::_events_view([
-    { sequence_number => 5, error_code => 'E1', description => 'old',   secret => 'x' },
-    { sequence_number => 9, error_code => 'E3', description => 'newest' },
-    { sequence_number => 7, error_code => 'E2', description => 'mid' },
-], 2);
-ok_case('events: unfixed count', $ev->{unfixed}, 3);
-ok_case('events: capped', scalar(@{ $ev->{recent} }), 2);
-ok_case('events: newest first', $ev->{recent}[0]{error_code}, 'E3');
+    { sequence_number => '1569', error_code => '1867',
+      description => 'Data reduction pool space warning',
+      object_type => 'mdiskgrp', object_name => 'Pool1_Silver',
+      last_timestamp => '260826031438', secret => 'x' },
+    { sequence_number => '1568', error_code => '',
+      description => 'SAS discovery occurred, configuration changes complete' },
+    { sequence_number => '1565', error_code => '',
+      description => 'Virtual Disk Copy Format Completed' },
+    { sequence_number => '1400', error_code => '0',
+      description => 'zero code is informational, not an alert' },
+]);
+ok_case('events: alerts only', $ev->{alerts}, 1);
+ok_case('events: total counted', $ev->{unfixed_total}, 4);
+ok_case('events: alert listed', $ev->{recent}[0]{error_code}, '1867');
+ok_case('events: object name kept', $ev->{recent}[0]{object_name}, 'Pool1_Silver');
+ok_case('events: informational not listed', scalar(@{ $ev->{recent} }), 1);
 ok_case('events: unknown keys dropped',
-    (exists $ev->{recent}[1]{secret} ? 'yes' : 'no'), 'no');
+    (exists $ev->{recent}[0]{secret} ? 'yes' : 'no'), 'no');
+
+# All-informational log: zero alerts, empty list, total still reported.
+my $quiet = PVE::API2::FlashSystem::_events_view([
+    { sequence_number => '2', error_code => '', description => 'chatter' },
+    { sequence_number => '1', description => 'no error_code key at all' },
+]);
+ok_case('events: quiet array = 0 alerts', $quiet->{alerts}, 0);
+ok_case('events: quiet recent empty', scalar(@{ $quiet->{recent} }), 0);
+ok_case('events: quiet total kept', $quiet->{unfixed_total}, 2);
+
+# Newest-first ordering and the cap apply to alerts.
+my $many = PVE::API2::FlashSystem::_events_view([
+    { sequence_number => '10', error_code => '1867', description => 'a' },
+    { sequence_number => '30', error_code => '1400', description => 'c' },
+    { sequence_number => '20', error_code => '2030', description => 'b' },
+], 2);
+ok_case('events: alerts capped', scalar(@{ $many->{recent} }), 2);
+ok_case('events: alerts newest first', $many->{recent}[0]{sequence_number}, '30');
 
 # ---- _ports_view --------------------------------------------------------------
 my $pp = PVE::API2::FlashSystem::_ports_view([

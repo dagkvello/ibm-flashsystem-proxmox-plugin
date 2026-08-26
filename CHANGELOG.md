@@ -12,7 +12,11 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
   state — registered into the API tree by a verified, marker-wrapped patch
   to `PVE/API2/Nodes.pm` with an APT re-apply hook. The GUI tab mounts via a
   guarded `PVE.panel.Config` override. Sections are eval-guarded and
-  time-bounded; field names pending validation across firmwares.
+  time-bounded. Validated on a FlashSystem 5200 running 8.7.0.3 — all
+  whitelisted field names matched. Events are split into alerts (non-zero
+  error code) and total unfixed: the raw `fixed=no` count is dominated by
+  informational chatter (1317 events on the validation array, one of them
+  actionable), which would otherwise bury a real pool-space warning.
 - **Thin provisioning** (`fsthin`): opt-in `mkvdisk -rsize 2% -autoexpand
   -warning 80%` for new volumes, with a matching GUI checkbox. Off by
   default; bare mkvdisk volumes are fully allocated (confirmed via

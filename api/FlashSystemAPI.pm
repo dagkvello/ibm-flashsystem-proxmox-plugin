@@ -101,16 +101,39 @@ sub _volumes_view {
     };
 }
 
+# An unfixed event is not necessarily a problem. `fixed=no` also returns the
+# array's informational chatter — SAS discovery, "Virtual Disk Copy Format
+# Completed" — which on a working system runs to four figures: 1317 on the
+# 8.7.0.3 demo array, of which exactly ONE was actionable. Alerts are the
+# events carrying a real error code; informational events carry an empty one.
+# Everything is counted, only alerts are listed, so a single 1867 pool-space
+# warning cannot hide behind a thousand copy-format notices.
+#
+# Note this is ARRAY-WIDE: lseventlog is a system log, not a pool log, so
+# every storage on the same array reports the same alerts.
+#
+# VALIDATE (payload optimisation, not correctness): Storage Virtualize also
+# accepts a server-side `alert=yes` filter. Confirm the REST spelling on an
+# array and the fetch shrinks from ~1300 rows to a handful; the client-side
+# split below stays as the belt either way.
 sub _events_view {
     my ($events, $max) = @_;
     $events = [] if ref($events) ne 'ARRAY';
     $max //= 10;
-    my @sorted = sort { ($b->{sequence_number} // 0) <=> ($a->{sequence_number} // 0) } @$events;
-    my @recent = map {
+    my @alerts = grep {
+        defined $_->{error_code} && $_->{error_code} =~ /\A\s*[1-9][0-9]*\s*\z/
+    } @$events;
+    my @sorted = sort { ($b->{sequence_number} // 0) <=> ($a->{sequence_number} // 0) } @alerts;
+    my $last = $#sorted < $max - 1 ? $#sorted : $max - 1;
+    my @recent = $last < 0 ? () : map {
         _whitelist($_, qw(sequence_number error_code description
             object_type object_name last_timestamp))
-    } @sorted[0 .. ($#sorted < $max - 1 ? $#sorted : $max - 1)];
-    return { unfixed => scalar(@$events), recent => \@recent };
+    } @sorted[0 .. $last];
+    return {
+        alerts        => scalar(@alerts),
+        unfixed_total => scalar(@$events),
+        recent        => \@recent,
+    };
 }
 
 sub _ports_view {

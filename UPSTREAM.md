@@ -142,8 +142,24 @@ can add one without re-implementing the browser. Guarded so ExtJS-internals
 drift in a future pve-manager degrades to "no tab", never a broken storage
 view. Requires `Datastore.Audit` or `Datastore.Allocate` on the storage.
 
-**VALIDATE on your array**: the `lseventlog` filter (`fixed=no`) and the
-concise-view field names of `lssystem`/`lsportfc`/`lseventlog` vary by
-firmware. Unknown fields degrade to omissions (whitelist extraction), so a
-mismatch shows an empty section rather than an error — check the sections
-render with real content on a demo system before relying on them.
+**Validated 2026-08-26** against an **IBM FlashSystem 5200, firmware
+8.7.0.3**: all five sections returned content and every whitelisted field
+name matched (`lssystem`: name/code_level/product_name/topology;
+`lsmdiskgrp -bytes` incl. `physical_*` on a *standard* pool, where physical
+equals effective and the preference is a correct no-op; `lsportfc`:
+id/fc_io_port_id/status/port_speed/attachment/node_name; `lseventlog`:
+sequence_number/error_code/description/object_type/object_name/last_timestamp).
+
+That run also produced a design fix: `fixed=no` returns the array's
+**informational** log as well as alerts — 1317 unfixed events, of which
+exactly one (`1867 Data reduction pool space warning`) was actionable. The
+view therefore splits `alerts` (events carrying a non-zero error code) from
+`unfixed_total`, and lists only alerts; the panel shows a green check when
+`alerts` is zero. `lseventlog` is a **system** log, so these are array-wide
+— every storage on one array reports the same alerts.
+
+**Still VALIDATE on other firmwares**: field names may differ (unknown
+fields degrade to omissions, so a mismatch shows an empty section, never an
+error). A server-side `alert=yes` filter would shrink the fetch from ~1300
+rows to a handful — worth confirming the REST spelling; the client-side
+split stays either way.
