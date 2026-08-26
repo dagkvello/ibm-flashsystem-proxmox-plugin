@@ -11,3 +11,4 @@ perl -I stub -c "$MOD"
 perl t_prefix.pl
 perl t_status.pl
 perl t_names.pl
+perl t_api.pl

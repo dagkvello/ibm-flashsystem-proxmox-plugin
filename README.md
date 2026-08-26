@@ -36,8 +36,10 @@ snapshot-as-block-device, cross-VM volume reassignment via
 
 ```
 FlashSystemPlugin.pm            the storage plugin
-gui/flashsystem-gui.js          Add/Edit dialogs for the PVE web UI
+gui/flashsystem-gui.js          Add/Edit dialogs + the FlashSystem health tab
 gui/install-flashsystem-gui.sh  installs the GUI extension + APT re-apply hook
+api/FlashSystemAPI.pm           read-only health & capacity API (PVE::API2::FlashSystem)
+api/install-flashsystem-api.sh  registers the API into the PVE tree + APT re-apply hook
 tests/                          unit tests — run anywhere perl exists, no array needed
 ```
 
@@ -87,6 +89,18 @@ systemctl restart pvedaemon pvestatd pveproxy
 
 # 2. the GUI dialogs (every node)
 cd gui && ./install-flashsystem-gui.sh
+
+# 3. the health API + FlashSystem tab (every node, optional but recommended)
+cd ../api && ./install-flashsystem-api.sh
+```
+
+The health tab (storage view → FlashSystem) shows array identity, pool
+capacity (physical and effective), volume counts, unfixed events and FC port
+state — read-only, requires `Datastore.Audit` (or `Datastore.Allocate`), and each section degrades
+independently if the array is slow. CLI equivalent:
+
+```sh
+pvesh get /nodes/$(hostname)/flashsystem/<storage>/health
 ```
 
 **After installing or updating the GUI extension, restart the browser as a

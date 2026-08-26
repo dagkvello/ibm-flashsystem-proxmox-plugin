@@ -3,30 +3,20 @@
 Ordered by intent, not commitment. Items marked **(design ready)** have an
 agreed approach; the rest are open.
 
-## 1. Health & capacity overview in the PVE GUI (design ready)
+## 1. Health & capacity overview in the PVE GUI — SHIPPED (experimental)
 
-A Ceph-style panel: array health, per-pool physical/effective capacity and
-reduction savings, volume counts vs limits, unfixed events, FC port and
-enclosure state — visible from Proxmox without opening the array GUI.
+Landed as `api/FlashSystemAPI.pm` + the "FlashSystem" storage tab (see
+UPSTREAM.md section 3). Still open within this item:
 
-Proxmox has no plugin API for either REST endpoints or GUI panels, but this
-project already patches `pvemanagerlib.js` with marker-wrapped blocks and an
-APT re-apply hook. The same technique extends to the API side:
-
-- **API bridge**: a `PVE::API2::FlashSystem` module installed next to the
-  plugin, exposing read-only endpoints such as
-  `GET /nodes/{node}/flashsystem/{storage}/health`, registered by patching
-  the API index the same marker+hook way. All array reads go through the
-  plugin's existing `_cmd` path (429 retry, bounded timeouts, per-cycle
-  caching) — the pvestatd lessons apply doubly to a dashboard.
-  Data sources: `lssystem` (health, code level), `lsmdiskgrp -bytes`
-  (physical + effective + savings), `lsvdisk` counts, `lseventlog` with
-  `alert=yes` / unfixed, `lsportfc`, `lsenclosurebattery` / drive summary.
-- **Panel**: a "FlashSystem" tab on the storage view, shipped inside the
-  existing `flashsystem-gui.js` snippet — no new install mechanism.
+- **Field validation across firmwares**: the events/ports sections use
+  whitelist extraction, so unknown field names degrade to empty sections —
+  they need confirming per firmware (8.7 pending demo validation; 9.x
+  unknown).
+- **More sections once validated**: `lsenclosurebattery`, drive summary,
+  reduction-savings figures, per-volume throttle visibility.
 - **Complementary path**: a small Prometheus exporter for shops that already
-  run Grafana — the PVE panel is for at-a-glance state, Grafana for history
-  and alerting. Either can land first; they share the metric list.
+  run Grafana — the PVE panel is at-a-glance state, Grafana is history and
+  alerting. Shares the metric list with the API module.
 
 ## 2. Thin provisioning refinements
 

@@ -111,3 +111,39 @@ After installing or updating the GUI extension, **restart the browser as a
 process** — consoles open as popups that inherit the parent page's parsed JS
 and show only a spinner until the browser restarts. No error appears
 anywhere; this is very expensive to diagnose the first time.
+
+## 3. Health & capacity API + "FlashSystem" storage tab
+
+`api/FlashSystemAPI.pm` (`PVE::API2::FlashSystem`) exposes read-only
+
+```
+GET /nodes/{node}/flashsystem                      -> flashsystem storages
+GET /nodes/{node}/flashsystem/{storage}/health     -> aggregate
+```
+
+— system identity, pool capacity (physical AND effective, same preference as
+1b), volume counts (this storage vs the whole pool), unfixed events, FC port
+state. Every array read goes through the plugin's `_cmd` (429 retry, token
+cache), one bounded, eval-guarded call per section: a slow or unreachable
+array yields partial data with per-section errors, never a hung API worker.
+The health method is `protected` because resolving the REST credential reads
+root-only `/etc/pve/priv/storage/<id>.pw`.
+
+Proxmox has no API plugin registry, so `api/install-flashsystem-api.sh`
+appends a marker-wrapped registration block to `PVE/API2/Nodes.pm` (executed
+at module load), verifies `PVE::API2::Nodes` still loads — restoring the
+original file if not — and installs an APT hook that re-applies the block
+after pve-manager upgrades. The same mechanism the GUI extension uses.
+
+The GUI side (in `gui/flashsystem-gui.js`) mounts a "FlashSystem" tab on the
+storage view by overriding `PVE.panel.Config.initComponent` — the storage
+browser assembles its tab items before Config consumes them, so the override
+can add one without re-implementing the browser. Guarded so ExtJS-internals
+drift in a future pve-manager degrades to "no tab", never a broken storage
+view. Requires `Datastore.Audit` or `Datastore.Allocate` on the storage.
+
+**VALIDATE on your array**: the `lseventlog` filter (`fixed=no`) and the
+concise-view field names of `lssystem`/`lsportfc`/`lseventlog` vary by
+firmware. Unknown fields degrade to omissions (whitelist extraction), so a
+mismatch shows an empty section rather than an error — check the sections
+render with real content on a demo system before relying on them.

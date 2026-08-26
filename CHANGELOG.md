@@ -5,11 +5,19 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
 ## Unreleased — 2026-08-26
 
+- **Health & capacity API + "FlashSystem" storage tab** (experimental):
+  `PVE::API2::FlashSystem` exposes read-only
+  `GET /nodes/{node}/flashsystem/{storage}/health` — system identity, pool
+  capacity (physical and effective), volume counts, unfixed events, FC port
+  state — registered into the API tree by a verified, marker-wrapped patch
+  to `PVE/API2/Nodes.pm` with an APT re-apply hook. The GUI tab mounts via a
+  guarded `PVE.panel.Config` override. Sections are eval-guarded and
+  time-bounded; field names pending validation across firmwares.
 - **Thin provisioning** (`fsthin`): opt-in `mkvdisk -rsize 2% -autoexpand
   -warning 80%` for new volumes, with a matching GUI checkbox. Off by
   default; bare mkvdisk volumes are fully allocated (confirmed via
   `lsvdisk` `capacity` == `real_capacity`), which also bypasses DRP
-  thin/dedup.
+  thin/dedup. The thin request shape itself is not yet validated live.
 - First public packaging: de-branded headers, documentation-range IPs in
   test fixtures, dual-home test harness (runs from this repo layout and
   from a vendored `files/` layout unchanged).
