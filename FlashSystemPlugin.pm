@@ -23,8 +23,9 @@ package PVE::Storage::Custom::FlashSystemPlugin;
 # STATUS: validated in production against FlashSystem firmware 8.7 (FC +
 # dm-multipath, 12-node PVE 9.2 cluster): provisioning, live migration,
 # move-disk, resize, snapshots incl. RAM state, delete, Kubernetes CSI
-# volumes. The fsthin (thin-provisioning) request path is NOT yet among
-# them — see the VALIDATE note in _mkvdisk_params. Search this file for
+# volumes. Thin provisioning (fsthin) is validated on a standard pool
+# (firmware 8.7.0.3, FlashSystem 5200) but not yet on a data reduction
+# pool — see the VALIDATE note in _mkvdisk_params. Search this file for
 # "VALIDATE:" for the remaining environment- and firmware-specific
 # decisions to confirm on YOUR array before production.
 # ---------------------------------------------------------------------------
@@ -432,11 +433,17 @@ sub alloc_image {
 # bypasses a data reduction pool's thin/dedup layer. `mkvdisk -rsize` is used
 # rather than the newer mkvolume because it behaves the same on standard
 # pools and DRPs — relevant since IBM is moving away from DRPs.
-# VALIDATE: the thin request shape has NOT been exercised against a live
-# array — only the thick path is production-proven. Before enabling fsthin
-# anywhere real, confirm on a scratch pool (specifically a data reduction
-# pool, where space-efficient parameter rules differ) that mkvdisk accepts
-# rsize/warning as percentage strings and autoexpand as a JSON boolean.
+# Validated 2026-08-26 on a STANDARD pool (FlashSystem 5200, firmware
+# 8.7.0.3): mkvdisk accepted rsize '2%', autoexpand as a JSON boolean and
+# warning '80%'. A 100 GiB volume was created with 5 GiB real capacity, the
+# array reported "Capacity savings: Thin-provisioned" at an 80% warning
+# threshold, and real capacity grew ahead of the data on write — autoexpand
+# confirmed working.
+#
+# VALIDATE: data reduction pools apply their own rules to space-efficient
+# volumes and were NOT covered by that test. Confirm on a scratch DRP before
+# enabling fsthin on one. (IBM is moving away from DRPs, so the standard-pool
+# path above is the strategically relevant one.)
 # VALIDATE: thin means overcommit — have array-side physical-free alerting in
 # place before enabling on pools shared with other workloads, and note IBM's
 # hint that capacity reporting changes in 9.x firmware.

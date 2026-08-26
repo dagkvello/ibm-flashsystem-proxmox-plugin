@@ -169,6 +169,13 @@ size is reserved at creation, and in a data reduction pool that also bypasses
 thin/dedup. `fsthin 1` switches new volumes to `-rsize 2% -autoexpand
 -warning 80%`, which behaves the same on standard pools and DRPs.
 
+Validated on a standard pool (FlashSystem 5200, firmware 8.7.0.3): a 100 GiB
+volume created with 5 GiB real capacity, reported as *Thin-provisioned* at an
+80% warning threshold, with real capacity growing ahead of the data on write.
+**Not yet validated on a data reduction pool** — DRPs apply their own rules
+to space-efficient volumes, so test on a scratch DRP first if that is where
+you intend to use it.
+
 Thin means **overcommit**: a pool driven to physical-full takes every volume
 in it offline. Have array-side physical-free alerting in place before
 enabling it on pools shared with other workloads. Existing volumes keep their

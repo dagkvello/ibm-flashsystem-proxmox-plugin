@@ -89,10 +89,21 @@ because rsize-thin is the mechanism that exists on standard pools too, which
 matters as IBM moves away from DRPs. Affects NEW volumes only; existing
 volumes convert online array-side via `addvdiskcopy -autodelete`.
 
-**The thin request shape has not yet been exercised against a live array** —
-see the VALIDATE note in `_mkvdisk_params`. Validate on a scratch pool
-(specifically a DRP) before enabling anywhere real, and have array-side
-physical-free alerting in place first: thin means overcommit.
+**Validated 2026-08-26** on a **standard pool** (FlashSystem 5200, firmware
+8.7.0.3): `mkvdisk` accepted `rsize` as `'2%'`, `autoexpand` as a JSON
+boolean and `warning` as `'80%'`. A 100 GiB volume was created with 5 GiB
+real capacity, reported by the array as *Capacity savings: Thin-provisioned*
+at an 80% warning threshold, and real capacity grew ahead of the data as it
+was written — autoexpand confirmed working.
+
+**Not yet validated on a data reduction pool.** DRPs apply their own rules
+to space-efficient volumes; test on a scratch DRP before enabling `fsthin`
+on one. (IBM state they are moving away from DRPs, so the standard-pool path
+is the strategically relevant one.)
+
+**Thin means overcommit.** Have array-side physical-free alerting in place
+before enabling on any pool shared with other workloads — a pool driven to
+physical-full takes every volume in it offline.
 
 ## 2. GUI Add/Edit dialogs
 

@@ -21,7 +21,9 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
   -warning 80%` for new volumes, with a matching GUI checkbox. Off by
   default; bare mkvdisk volumes are fully allocated (confirmed via
   `lsvdisk` `capacity` == `real_capacity`), which also bypasses DRP
-  thin/dedup. The thin request shape itself is not yet validated live.
+  thin/dedup. Validated on a standard pool (5200 / 8.7.0.3): 100 GiB
+  presented, 5 GiB real, autoexpand growing on write. Data reduction pools
+  remain untested for this path.
 - First public packaging: de-branded headers, documentation-range IPs in
   test fixtures, dual-home test harness (runs from this repo layout and
   from a vendored `files/` layout unchanged).
