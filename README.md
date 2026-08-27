@@ -32,6 +32,32 @@ template VMs on LVM or dir storage; full clones *onto* this storage work),
 snapshot-as-block-device, cross-VM volume reassignment via
 `qm disk move --target-vmid` (attach-by-volid works).
 
+### What that validation does and does not cover
+
+The table above covers the **storage plugin** — everything under "proven
+operations" has run in production on a 12-node cluster. The reporting surfaces
+added later have not all reached hardware, and it matters which is which,
+because an unvalidated whitelist degrades to an empty section rather than an
+error and can therefore look like a working panel with nothing in it.
+
+| Surface | State |
+|---|---|
+| Storage plugin (provision, resize, migrate, clone, snapshot, delete) | Production, 12 nodes, firmware 8.7 |
+| Health API + storage-view tab | Validated on a FlashSystem 5200 / 8.7.0.3 — all five sections returned content and every whitelisted field name matched |
+| Thin provisioning (`fsthin`) | Validated on a **standard** pool (5200 / 8.7.0.3): 100 GiB presented, 5 GiB real, autoexpand confirmed growing on write |
+| Thin provisioning on a **data reduction pool** | **Not validated.** DRPs apply their own rules to space-efficient volumes |
+| Datacenter overview panel | **Unit coverage only** |
+| Performance endpoint (`lsnodestats`, `lssystemstats`, `lsthrottle`, `-history`) | **Unit coverage only** |
+| Per-volume consumption + `lssevdiskcopy` fill | **Unit coverage only** |
+| Server-side `lseventlog` alert filter | **Unit coverage only** — falls back to the previous form if a firmware rejects it, and detects a firmware that ignores it |
+
+Three specific unknowns the first hardware run is designed to settle, all
+documented in `UPSTREAM.md` section 4: whether `lssystemstats` is reachable
+over REST at all (it is absent from IBM's published OpenAPI schema for 8.7.0
+and 9.1.3 while `/lsnodestats` is present, so a derived fallback ships either
+way), which unit the `*_ms` statistics actually use, and whether the
+`lseventlog` alert parameters are honoured or silently ignored.
+
 ## Layout
 
 ```
