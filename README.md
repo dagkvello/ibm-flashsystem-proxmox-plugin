@@ -100,8 +100,12 @@ Two views, both read-only and both needing `Datastore.Audit` (or
 * **Storage view → FlashSystem** — one storage: array identity, pool capacity
   (physical and effective), volume counts, unfixed alerts, FC port state.
 * **Datacenter → FlashSystem** — the whole array: every pool in use and which
-  storages share each one, with prefix, thin/thick and volume counts. One
-  request per array, de-duplicated server-side.
+  storages share each one, with prefix, thin/thick and volume counts; the
+  largest volumes and a per-guest rollup, including the volumes in each pool
+  this cluster does not manage; and array performance — front-end, back-end
+  and drive IOPS, bandwidth and latency with five-minute peaks, per-canister
+  CPU and cache, and configured throttles. One request per array per section,
+  de-duplicated server-side.
 
 Each section degrades independently if the array is slow, and a section that
 fails omits its numbers rather than reporting zeros. CLI equivalents:
@@ -109,7 +113,16 @@ fails omits its numbers rather than reporting zeros. CLI equivalents:
 ```sh
 pvesh get /nodes/$(hostname)/flashsystem/<storage>/health
 pvesh get /nodes/$(hostname)/flashsystem/<storage>/overview
+pvesh get /nodes/$(hostname)/flashsystem/<storage>/performance
 ```
+
+Two limits stated up front, because both are the array's rather than the
+plugin's. **Per-volume performance does not exist** in the REST API — the
+array's own GUI has no per-volume chart either, and the only source is the
+`/dumps/iostats` XML, written once per `startstats` interval. **Per-volume
+fill is not reported in data reduction pools**, where IBM documents the
+`lssevdiskcopy` capacity fields as blank; the panel says so rather than
+drawing an empty bar. See `UPSTREAM.md` section 4.
 
 **After installing or updating the GUI extension, restart the browser as a
 process.** A hard refresh, disable-cache and logout are all insufficient — VM
@@ -259,6 +272,18 @@ its fields, never report zeros). No array needed.
    empirical backoff?
 4. **Object-name limits**: is 63 chars the documented cap for volume and
    snapshot names on all current platforms?
+5. **Licensing of the derived sample**: this plugin started from the sample
+   code in the *Storage Virtualize + Proxmox VE* whitepaper (see
+   `UPSTREAM.md`). Under what terms was that sample published, and what does
+   that allow for the licence of this derived work?
+6. **`lssystemstats` over REST**: it is documented in the CLI reference but
+   absent from the published REST OpenAPI schema for both 8.7.0 and 9.1.3,
+   while `/lsnodestats` is present. Is it reachable, and is its absence from
+   the schema intentional?
+7. **The `*_ms` unit**: the 8.7 `stat_name` descriptions say microseconds, the
+   attribute table reads as milliseconds, and the Performance statistics page
+   says the CLI always displays microseconds. Which is authoritative? The
+   panel currently renders these values unlabelled rather than guess.
 
 ## License
 
