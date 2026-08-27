@@ -72,12 +72,12 @@ ok_case('pool: used pct rounded', $pv->{provision_used_pct}, 68);
 ok_case('pool: reduction flag kept', $pv->{data_reduction}, 'yes');
 
 # ---- _volumes_view ------------------------------------------------------------
-my $scfg = { fsprefix => 'pmcl01' };
+my $scfg = { fsprefix => 'pvecl1' };
 my $vols = PVE::API2::FlashSystem::_volumes_view([
-    { name => 'pmcl01-vm-1-disk-0',  capacity => '100' },
+    { name => 'pvecl1-vm-1-disk-0',  capacity => '100' },
     { name => 'other-vm-1-disk-0',   capacity => '50'  },   # foreign prefix
-    { name => 'pmcl01-vm-2-state-x', capacity => '25'  },
-    { name => 'pmcl01-tierlun-00',   capacity => '999' },   # ours, not a PVE volume
+    { name => 'pvecl1-vm-2-state-x', capacity => '25'  },
+    { name => 'pvecl1-tierlun-00',   capacity => '999' },   # ours, not a PVE volume
 ], $scfg);
 ok_case('volumes: pool total', $vols->{pool_total}, 4);
 ok_case('volumes: ours only', $vols->{ours}, 2);
@@ -89,7 +89,7 @@ ok_case('volumes: ours bytes', $vols->{ours_provisioned}, 125);
 my $noprefix = PVE::API2::FlashSystem::_volumes_view([
     { name => 'vm-102-disk-0',        capacity => '34359738368' },
     { name => 'vm-102-state-test',    capacity => '34808528896' },
-    { name => 'pmcl01-vm-196-disk-0', capacity => '34359738368' },   # another storage's
+    { name => 'pvecl1-vm-196-disk-0', capacity => '34359738368' },   # another storage's
     { name => 'volume-9f3a-openstack', capacity => '2750000000000' }, # not PVE at all
 ], {});
 ok_case('volumes: prefixless PVE shapes only', $noprefix->{ours}, 2);
@@ -183,11 +183,11 @@ ok_case('index returns address',
 # Two storages sharing one pool, counted from a SINGLE lsvdisk result by
 # each storage's own prefix — the saving the endpoint exists for.
 my $shared = [
-    { name => 'pmcl01_Gold-vm-1-disk-0', capacity => '100' },
+    { name => 'pvecl1_Gold-vm-1-disk-0', capacity => '100' },
     { name => 'k8sg-vm-9999-pvc-abc',    capacity => '50'  },
     { name => 'foreign-vm-1-disk-0',     capacity => '999' },
 ];
-my $tier = PVE::API2::FlashSystem::_volumes_view($shared, { fsprefix => 'pmcl01_Gold' });
+my $tier = PVE::API2::FlashSystem::_volumes_view($shared, { fsprefix => 'pvecl1_Gold' });
 my $k8s  = PVE::API2::FlashSystem::_volumes_view($shared, { fsprefix => 'k8sg' });
 ok_case('overview: tier storage sees its own', $tier->{ours}, 1);
 ok_case('overview: k8s storage sees its own', $k8s->{ours}, 1);
@@ -285,7 +285,7 @@ ok_case('history: unknown series dropped', (exists $hv->{bogus} ? 'yes' : 'no'),
 # ---- _throttles_view ----------------------------------------------------------
 my $tv = PVE::API2::FlashSystem::_throttles_view([
     { throttle_id => '2', throttle_name => 'throttle2', object_id => '9',
-      object_name => 'pmcl01_Gold-vm-124-disk-0', throttle_type => 'vdisk', IOPs_limit => '20' },
+      object_name => 'pvecl1_Gold-vm-124-disk-0', throttle_type => 'vdisk', IOPs_limit => '20' },
 ]);
 ok_case('throttles: total', $tv->{total}, 1);
 ok_case('throttles: mixed-case field kept', $tv->{throttles}[0]{IOPs_limit}, '20');
@@ -296,9 +296,9 @@ ok_case('throttles: blank bandwidth dropped',
 # A storage with no prefix translates pass-through, so it matches any
 # PVE-shaped name in the pool. When a PREFIXED storage also matches, the
 # prefixed one is the real owner and must win regardless of peer order.
-my $prefixed = [ 'tier-gold', { fsprefix => 'pmcl01_Gold' } ];
+my $prefixed = [ 'tier-gold', { fsprefix => 'pvecl1_Gold' } ];
 my $bare     = [ 'legacy',    {} ];
-my $c1 = PVE::API2::FlashSystem::_classify_volume('pmcl01_Gold-vm-124-disk-0', [ $bare, $prefixed ]);
+my $c1 = PVE::API2::FlashSystem::_classify_volume('pvecl1_Gold-vm-124-disk-0', [ $bare, $prefixed ]);
 ok_case('classify: prefixed owner wins', $c1->{storage}, 'tier-gold');
 ok_case('classify: volname translated', $c1->{volname}, 'vm-124-disk-0');
 ok_case('classify: vmid extracted', $c1->{vmid}, 124);
@@ -307,13 +307,13 @@ ok_case('classify: bare storage claims unprefixed', $c2->{storage}, 'legacy');
 ok_case('classify: foreign object unowned',
     PVE::API2::FlashSystem::_classify_volume('VMWARE_LUN_04', [ $prefixed, $bare ]), undef);
 ok_case('classify: array snapshot object unowned',
-    PVE::API2::FlashSystem::_classify_volume('pmcl01_Gold-vm-124-disk-0.snap1', [ $prefixed ]), undef);
+    PVE::API2::FlashSystem::_classify_volume('pvecl1_Gold-vm-124-disk-0.snap1', [ $prefixed ]), undef);
 
 # ---- _top_volumes_view --------------------------------------------------------
 my @pool_rows = (
-    { name => 'pmcl01_Gold-vm-124-disk-0', capacity => '107374182400', status => 'online', se_copy_count => '0' },
-    { name => 'pmcl01_Gold-vm-124-disk-1', capacity => '53687091200',  status => 'online', se_copy_count => '0' },
-    { name => 'pmcl01_Gold-vm-900-disk-0', capacity => '10737418240',  status => 'offline', se_copy_count => '1' },
+    { name => 'pvecl1_Gold-vm-124-disk-0', capacity => '107374182400', status => 'online', se_copy_count => '0' },
+    { name => 'pvecl1_Gold-vm-124-disk-1', capacity => '53687091200',  status => 'online', se_copy_count => '0' },
+    { name => 'pvecl1_Gold-vm-900-disk-0', capacity => '10737418240',  status => 'offline', se_copy_count => '1' },
     { name => 'VMWARE_PROD_LUN0',          capacity => '2199023255552', status => 'online', se_copy_count => '0' },
 );
 my $tvv = PVE::API2::FlashSystem::_top_volumes_view(\@pool_rows, [ $prefixed ], limit => 2);
@@ -332,7 +332,7 @@ ok_case('top: attention total', $tvv->{attention_total}, 1);
 # A corrupt fast-write state is a repair job, not a slow disk - it must reach
 # the attention list even while the volume reports itself online.
 my $corrupt = PVE::API2::FlashSystem::_top_volumes_view([
-    { name => 'pmcl01_Gold-vm-500-disk-0', capacity => '1073741824',
+    { name => 'pvecl1_Gold-vm-500-disk-0', capacity => '1073741824',
       status => 'online', fast_write_state => 'corrupt' },
 ], [ $prefixed ], limit => 5);
 ok_case('top: corrupt flagged despite online', $corrupt->{attention_total}, 1);
@@ -342,25 +342,25 @@ ok_case('top: corrupt state reported', $corrupt->{attention}[0]{fast_write_state
 # autoexpand ON: real_capacity grows, so the meaningful denominator is the
 # PROVISIONED size.
 my $fmap = PVE::API2::FlashSystem::_sev_fill_view([
-    { vdisk_name => 'pmcl01_Gold-vm-124-disk-0', used_capacity => '5368709120',
+    { vdisk_name => 'pvecl1_Gold-vm-124-disk-0', used_capacity => '5368709120',
       real_capacity => '10737418240', free_capacity => '5368709120',
       autoexpand => 'on', warning => '80' },
-    { vdisk_name => 'pmcl01_Gold-vm-124-disk-1', used_capacity => '9126805504',
+    { vdisk_name => 'pvecl1_Gold-vm-124-disk-1', used_capacity => '9126805504',
       real_capacity => '10737418240', autoexpand => 'off' },
     # A data reduction pool returns these fields BLANK; such a row must not
     # be treated as a volume with zero usage.
-    { vdisk_name => 'pmcl01_Gold-vm-900-disk-0', used_capacity => '',
+    { vdisk_name => 'pvecl1_Gold-vm-900-disk-0', used_capacity => '',
       real_capacity => '', free_capacity => '' },
 ]);
 ok_case('fill: blank DRP row skipped',
-    (exists $fmap->{by_name}{'pmcl01_Gold-vm-900-disk-0'} ? 'kept' : 'skipped'), 'skipped');
+    (exists $fmap->{by_name}{'pvecl1_Gold-vm-900-disk-0'} ? 'kept' : 'skipped'), 'skipped');
 ok_case('fill: usable count', $fmap->{usable}, 2);
 ok_case('fill: raw copy count', $fmap->{copies}, 3);
 
 my $frows = [
-    { array_name => 'pmcl01_Gold-vm-124-disk-0', capacity => 107374182400 },
-    { array_name => 'pmcl01_Gold-vm-124-disk-1', capacity => 107374182400 },
-    { array_name => 'pmcl01_Gold-vm-777-disk-0', capacity => 107374182400 },
+    { array_name => 'pvecl1_Gold-vm-124-disk-0', capacity => 107374182400 },
+    { array_name => 'pvecl1_Gold-vm-124-disk-1', capacity => 107374182400 },
+    { array_name => 'pvecl1_Gold-vm-777-disk-0', capacity => 107374182400 },
 ];
 my $hits = PVE::API2::FlashSystem::_apply_fill($frows, $fmap);
 ok_case('fill: rows measured', $hits, 2);
@@ -478,7 +478,7 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
 # ---- end-to-end: a data reduction pool must not be asked for fill -----------
 # IBM documents the lssevdiskcopy capacity fields as blank in a DRP, so asking
 # spends one of the array's scarce serialised CLI slots to learn nothing. Every
-# pmcl01 tier is a DRP, making this the production path rather than an edge.
+# pvecl1 tier is a DRP, making this the production path rather than an edge.
 {
     no warnings 'redefine';
     my @seen;
@@ -535,16 +535,16 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
 
 
 # ---- three-way split: ours / siblings / another tenant -----------------------
-# pmcl01 puts Gold (prefix pmcl01_Gold) and k8s-gold (prefix k8sg) on the SAME
+# pvecl1 puts Gold (prefix pvecl1_Gold) and k8s-gold (prefix k8sg) on the SAME
 # Pool0_Gold. Without a `self` notion the storage tab counted its own sibling's
 # Kubernetes PVCs as the VMware tenant's, which on the real cluster was ~10 TB
 # of misdirected blame - and the operator escalates a capacity ticket to the
 # storage team for their own growth.
 {
-    my $gold = [ 'Gold',     { fsprefix => 'pmcl01_Gold' } ];
+    my $gold = [ 'Gold',     { fsprefix => 'pvecl1_Gold' } ];
     my $k8s  = [ 'k8s-gold', { fsprefix => 'k8sg' } ];
     my @rows = (
-        { name => 'pmcl01_Gold-vm-124-disk-0', capacity => '100', status => 'online' },
+        { name => 'pvecl1_Gold-vm-124-disk-0', capacity => '100', status => 'online' },
         { name => 'k8sg-vm-9999-pvc-abc',      capacity => '200', status => 'online' },
         { name => 'k8sg-vm-9999-pvc-def',      capacity => '300', status => 'online' },
         { name => 'VMWARE_LUN0',               capacity => '900', status => 'online' },

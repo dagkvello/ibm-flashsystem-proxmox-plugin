@@ -494,8 +494,9 @@ sub _top_volumes_view {
             # Another flashsystem storage in THIS cluster sharing the pool.
             # Folding these into "foreign" is how a storage tab came to
             # attribute the cluster's own Kubernetes PVCs to the VMware
-            # tenant next door - on pmcl01, Gold and k8s-gold share
-            # Pool0_Gold, so it was 10 TB of self-inflicted blame. Aggregate
+            # tenant next door - on the validation cluster a tier storage
+            # and its CSI storage share one pool, so it was 10 TB of
+            # self-inflicted blame. Aggregate
             # only: the caller has audit on THIS storage, not on its
             # siblings, so their volume names must not appear.
             $sibling_count++;

@@ -718,7 +718,8 @@ Ext.define('PVE.FlashSystemUI', {
         let fill = top.fill;
         if (fill && !fill.available) {
             let why = {
-                // The important one: every pmcl01 tier is a DRP.
+                // The important one: every tier on the validation cluster
+                // is a DRP, so this is the normal path there.
                 'data-reduction-pool': gettext(
                     'Per-volume fill is not reported for volumes in a data reduction pool '
                     + '- the array leaves those fields blank. Sizes above are provisioned capacity.'),
@@ -744,9 +745,9 @@ Ext.define('PVE.FlashSystemUI', {
         }
 
         // Other storages of OURS sharing this pool. Only the storage-scoped
-        // view carries this; on pmcl01 it is the k8s-* CSI storage sitting on
-        // the same tier, and counting it as another tenant sent a capacity
-        // question to the storage team that belonged to our own Kubernetes.
+        // view carries this; it is typically a CSI storage sitting on the
+        // same tier, and counting it as another tenant sends a capacity
+        // question to the storage team that belongs to one's own Kubernetes.
         let sib = top.siblings;
         if (sib && sib.count) {
             h.push(`<div class="fs-note">`

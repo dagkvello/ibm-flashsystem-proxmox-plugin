@@ -12,7 +12,7 @@
 #
 # The length gate exists because Storage Virtualize caps object names at 63
 # and mkvdisk past the cap fails with an opaque CMMVC error. The boundary
-# case is real: fsprefix 'pmcl01_Archive' (15 with separator) + the CSI
+# case is real: fsprefix 'pvecl1_Archive' (15 with separator) + the CSI
 # name shape vm-9999-pvc-<36-char-uuid> (48) = exactly 63.
 #
 # Run:  run.sh in this directory
@@ -74,7 +74,7 @@ for my $c (
 }
 
 # ---- alloc_image gates: both die before any REST call ----------------------
-my $scfg = { fsprefix => 'pmcl01_Archive', fspool => 'Pool3_Archive' };
+my $scfg = { fsprefix => 'pvecl1_Archive', fspool => 'Pool3_Archive' };
 
 # The documented boundary: Archive's 15-char prefix + 48-char CSI name = 63.
 ok_case('boundary arithmetic',

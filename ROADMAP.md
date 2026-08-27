@@ -36,7 +36,8 @@ section 3. Still open within this item:
   alternative — `used_capacity_before_reduction` — is detailed-view only,
   i.e. one serialised call per volume. Worth offering as an explicit
   on-demand drill-down for a single volume; never as part of the always-on
-  view. This matters because every pmcl01 tier is a DRP.
+  view. This matters wherever every tier is a DRP, which was the case
+  on the cluster this was validated against.
 - **More sections once validated**: `lsenclosurebattery`, drive summary,
   reduction-savings figures, `lsvdiskprogress` / `lsvdisksyncprogress` (a
   volume actively formatting or resyncing explains latency), `lsmdisk`

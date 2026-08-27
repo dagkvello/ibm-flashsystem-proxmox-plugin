@@ -314,8 +314,8 @@ compressed copies in a DRP. `_collect_fill` therefore checks
 makes — and skips the query entirely rather than spending a request to
 learn nothing. The panel then says per-volume fill is not reported for a DRP,
 instead of drawing an empty bar that would read as "this volume is empty".
-Every pmcl01 tier is a DRP, so this is the normal path there, not the edge
-case.
+Every tier on the cluster this was validated against is a DRP, so this is
+the normal path there, not the edge case.
 
 **Volumes this cluster does not manage are counted, and named only with
 audit on the whole storage tree.** On a pool shared with VMware or another
