@@ -41,6 +41,14 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
   the pool is counted separately from another tenant. Folding siblings into
   "foreign" made a tier storage attribute its own cluster's Kubernetes PVCs to
   the VMware volumes next door.
+- **Theme-safe styling**: one injected stylesheet replaces ~100 inline style
+  attributes. The previous inline colours were broken under one theme or the
+  other — the datacenter panel assumed dark, the health panel assumed light.
+  Text is now `currentColor` plus `opacity` and lines are neutral rgba greys,
+  so no theme detection is needed; only four semantic hues are absolute, and
+  a test asserts nothing else creeps back. Performance renders as a tile grid
+  with sparklines, and peaks print the time alone since they cover the last
+  five minutes.
 - **GUI render tests** (`tests/t_gui.js`, stubbed ExtJS, skipped without node):
   two defects found in review were renderer-only — data the API computed,
   returned and unit-tested that nothing ever displayed — which no Perl test

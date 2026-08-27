@@ -184,11 +184,19 @@ const has = (name, html, needle, want = true) =>
     has('spark: svg emitted', html, '<svg');
     has('spark: polyline emitted', html, 'polyline');
     ok('spark: no NaN coordinates', html.includes('NaN'), false);
-    has('perf: peak time formatted', html, '2026-08-26 10:43:04');
+    // Peaks cover the last five minutes, so the tile prints the time alone -
+    // the date is always today, and printing it overflowed the tile.
+    has('perf: peak time is time-only', html, '10:43:04');
+    ok('perf: peak time drops the date', html.includes('2026-08-26 10:43:04'), false);
+    // The event log keeps the full stamp, where the date is real information.
+    ok('perf: full stamp still available', UI.stamp('260826104304'), '2026-08-26 10:43:04');
     // The unit is genuinely ambiguous in IBM's own docs, so it must not be
     // asserted on screen.
-    ok('perf: latency carries no unit', /Read latency<\/td>\s*<td[^>]*><b>10<\/b> ms/.test(html), false);
+    ok('perf: latency value carries no unit',
+        /Read latency<\/div><div class="fs-tile-v">10<\/div>/.test(html), true);
     has('perf: ambiguity disclosed', html, 'microseconds or milliseconds');
+    // Long labels and values must not break the tile grid.
+    has('perf: value uses tabular figures', html, 'fs-tile-v');
 }
 
 // ---- derived stats must say so, and must not deny live node data ---------
@@ -247,6 +255,33 @@ const has = (name, html, needle, want = true) =>
     ok('sort: input not mutated', rows[0].name, 'a');
     const asc = UI.sortRows(rows, 'capacity', 'asc');
     ok('sort: ascending', asc[0].name, 'a');
+}
+
+
+// ---- theme safety: no hardcoded light- or dark-only colours ---------------
+// PVE ships both themes. The first cut of this panel hardcoded dark greys
+// (#888 text, #2a2a2a bar tracks) while the older health panel hardcoded the
+// opposite (#eee bar on #000 text) - each looked broken under the other
+// theme. Text is currentColor plus opacity, and lines and fills are neutral
+// rgba greys, so nothing here needs to know which theme is active.
+{
+    const fs = require('fs');
+    const srcText = fs.readFileSync(src, 'utf8');
+    // Strip comments before scanning: the rationale above quotes the old values.
+    const code = srcText.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const hexes = [...new Set((code.match(/#[0-9a-fA-F]{6}\b/g) || []))];
+    // The only absolute colours allowed are the four semantic tokens, which
+    // are mid-tones chosen to carry on both grounds and used on icons and
+    // bars rather than body text.
+    const allowed = ['#3ba55d', '#c8860d', '#d9534f', '#4b8fc7'];
+    const stray = hexes.filter((c) => !allowed.includes(c.toLowerCase()));
+    ok('theme: no stray hardcoded colours', stray.join(',') || 'none', 'none');
+    ok('theme: semantic tokens defined once',
+        allowed.every((c) => code.includes(c)), true);
+    // A literal grey text colour is the specific regression that made the
+    // panel unreadable on the light theme.
+    ok('theme: no literal grey text', /color:\s*#(888|666|999|ccc|eee)\b/.test(code), false);
+    ok('theme: muted text is opacity-based', code.includes('.fs-muted{opacity:'), true);
 }
 
 console.log(fail ? `\n${fail} FAILURE(S)` : '\nall gui cases pass');

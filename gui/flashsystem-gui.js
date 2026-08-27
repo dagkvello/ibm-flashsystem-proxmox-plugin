@@ -178,7 +178,7 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
 
     scrollable: true,
     bodyPadding: 15,
-    html: '<div class="fs-health">' + gettext('Loading...') + '</div>',
+    html: '<div class="fs-root fs-health fs-muted">' + gettext('Loading...') + '</div>',
 
     tbar: [
         {
@@ -208,12 +208,14 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
         let me = this;
         let e = me.esc;
         let h = [];
-        let row = (k, v) => `<tr><td style="padding:2px 14px 2px 0;color:#888;white-space:nowrap;">${e(k)}</td><td style="padding:2px 0;">${v}</td></tr>`;
-        let head = t => `<h3 style="margin:14px 0 6px;">${e(t)}</h3>`;
+        let UI = PVE.FlashSystemUI;
+        UI.ensureStyles();
+        let row = (k, v) => `<tr><td class="fs-muted" style="white-space:nowrap;">${e(k)}</td><td>${v}</td></tr>`;
+        let head = t => `<div class="fs-sec-h" style="margin-top:14px;">${e(t)}</div>`;
 
         if (d.system) {
             h.push(head(gettext('System')));
-            h.push('<table>');
+            h.push('<table class="fs-tbl">');
             h.push(row(gettext('Name'), e(d.system.name || '-')));
             h.push(row(gettext('Product'), e(d.system.product_name || '-')));
             h.push(row(gettext('Firmware'), e(d.system.code_level || '-')));
@@ -223,12 +225,13 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
         if (d.pool) {
             let p = d.pool;
             let pct = p.provision_used_pct || 0;
-            let color = pct >= 90 ? '#c0392b' : (pct >= 75 ? '#c87f0a' : '#2d7d46');
+            let color = pct >= 90 ? 'var(--fs-crit)' : (pct >= 75 ? 'var(--fs-warn)' : 'var(--fs-ok)');
             h.push(head(gettext('Pool') + ' ' + (d.pool_name || p.name || '')));
-            h.push(`<div style="max-width:420px;background:#eee;border:1px solid #ccc;border-radius:3px;height:18px;position:relative;">`
-                + `<div style="background:${color};width:${Math.min(pct, 100)}%;height:100%;border-radius:2px;"></div>`
-                + `<span style="position:absolute;top:0;left:8px;font-size:11px;line-height:18px;color:#000;">${pct}% ${e(gettext('of physical'))}</span></div>`);
-            h.push('<table style="margin-top:6px;">');
+            h.push('<div class="fs-bar" style="max-width:420px;">'
+                + `<i style="width:${Math.min(pct, 100)}%;background:${color};"></i></div>`);
+            h.push(`<div class="fs-muted" style="font-size:12px;margin-top:4px;">`
+                + `${pct}% ${e(gettext('of physical'))}</div>`);
+            h.push('<table class="fs-tbl" style="margin-top:6px;">');
             h.push(row(gettext('Physical (usable)'),
                 `${me.fmtBytes(p.provision_used)} / ${me.fmtBytes(p.provision_total)} (${me.fmtBytes(p.provision_free)} ${e(gettext('free'))})`));
             if (p.physical_capacity && p.capacity && +p.capacity !== +p.physical_capacity) {
@@ -255,7 +258,7 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
             // fixed at creation, so this only gets more expensive to fix.
             h.push(row(gettext('Array name prefix'), d.prefix
                 ? e(d.prefix)
-                : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> '
+                : UI.icon('warn')
                   + e(gettext('none — objects are unprefixed and share the pool namespace'))));
             h.push('</table>');
         }
@@ -263,7 +266,7 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
         if (d.ports) {
             let ok = d.ports.active === d.ports.total;
             h.push(head(gettext('FC ports')));
-            h.push(`<div>${ok ? '' : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> '}`
+            h.push(`<div>${ok ? '' : UI.icon('warn')}`
                 + `${d.ports.active} / ${d.ports.total} ${e(gettext('active'))}</div>`);
         }
 
@@ -282,21 +285,21 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
             h.push(head(gettext('Array alerts')));
             h.push('<div>'
                 + (alerts === 0
-                    ? '<i class="fa fa-check" style="color:#2d7d46;"></i> ' + e(gettext('No unfixed alerts'))
-                    : `<i class="fa fa-exclamation-triangle" style="color:#c0392b;"></i> <b>${alerts}</b> ${e(gettext('unfixed'))}`)
+                    ? UI.icon('ok') + e(gettext('No unfixed alerts'))
+                    : UI.icon('crit') + `<b>${alerts}</b> ${e(gettext('unfixed'))}`)
                 // Shown only when the whole unfixed log was fetched: under the
                 // server-side alert filter those informational events are not
                 // in the payload, and printing 0 would claim there are none.
                 + (d.events.unfixed_total === undefined
                     ? ''
-                    : ` <span style="color:#888;">(${d.events.unfixed_total} ${e(gettext('unfixed events array-wide, incl. informational'))})</span>`)
+                    : ` <span class="fs-muted">(${d.events.unfixed_total} ${e(gettext('unfixed events array-wide, incl. informational'))})</span>`)
                 + '</div>');
             if (alerts > 0 && d.events.recent && d.events.recent.length) {
                 h.push('<table style="font-size:12px;margin-top:6px;">');
                 d.events.recent.forEach(ev => {
                     h.push(row(me.fmtEventTime(ev.last_timestamp) || ev.sequence_number || '',
                         `<b>${e(ev.error_code || '')}</b> ${e(ev.description || '')}`
-                        + (ev.object_name ? ` <span style="color:#888;">(${e(ev.object_name)})</span>` : '')));
+                        + (ev.object_name ? ` <span class="fs-dim">(${e(ev.object_name)})</span>` : '')));
                 });
                 h.push('</table>');
             }
@@ -309,7 +312,7 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
             h.push('</table>');
         }
 
-        return '<div class="fs-health">' + h.join('') + '</div>';
+        return '<div class="fs-root fs-health">' + h.join('') + '</div>';
     },
 
     reloadHealth: function() {
@@ -330,7 +333,7 @@ Ext.define('PVE.storage.FlashSystemHealthPanel', {
                 me.update(me.renderHealth(me.healthData));
             },
             failure: function(response) {
-                me.update('<div style="color:#c0392b;">'
+                me.update('<div class="fs-root fs-err">'
                     + Ext.htmlEncode(response.htmlStatus || gettext('Query failed'))
                     + '</div>');
             },
@@ -436,16 +439,120 @@ Ext.define('PVE.storage.FlashSystemConfigOverride', {
 
 Ext.define('PVE.FlashSystemUI', {
     singleton: true,
+    // ---- stylesheet -------------------------------------------------------
+    //
+    // Injected once, rather than 100+ inline style attributes. The important
+    // part is that NOTHING here hardcodes a light or dark value: PVE ships
+    // both themes, and the earlier inline styling assumed dark, so a
+    // #2a2a2a bar track and a #444 border rendered as smudges on the default
+    // light theme.
+    //
+    // Two rules keep it theme-proof without detecting the theme at all:
+    //   * text is `currentColor`, and muted text is `opacity`, which is
+    //     relative to whatever the theme already chose;
+    //   * lines and fills are rgba(128,128,128,a) — a neutral grey reads
+    //     correctly over white and over near-black alike.
+    // Only the four semantic hues are absolute, and they are mid-tones with
+    // enough contrast on both grounds. They are used on icons and bars, not
+    // on body text, so legibility never depends on them.
+    CSS: [
+        '.fs-root{--fs-line:rgba(128,128,128,.30);--fs-soft:rgba(128,128,128,.16);',
+        '--fs-fill:rgba(128,128,128,.10);--fs-track:rgba(128,128,128,.22);',
+        '--fs-ok:#3ba55d;--fs-warn:#c8860d;--fs-crit:#d9534f;--fs-accent:#4b8fc7;',
+        'font-size:13px;line-height:1.45;}',
+        '.fs-root .fs-title{font-size:15px;font-weight:600;margin:0 0 1px;}',
+        '.fs-sub{opacity:.62;font-size:12px;margin-bottom:10px;}',
+        '.fs-muted{opacity:.62;}',
+        '.fs-dim{opacity:.42;}',
+        '.fs-ok{color:var(--fs-ok);}.fs-warn{color:var(--fs-warn);}.fs-crit{color:var(--fs-crit);}',
+        '.fs-array{margin-bottom:26px;}',
+        '.fs-card{border:1px solid var(--fs-line);border-radius:5px;padding:11px 13px;',
+        'margin-top:12px;background:var(--fs-fill);}',
+        '.fs-card-h{display:flex;justify-content:space-between;align-items:baseline;',
+        'gap:14px;margin-bottom:7px;}',
+        '.fs-card-h b{font-size:13px;}',
+        '.fs-status{display:flex;flex-wrap:wrap;gap:3px 20px;font-size:12px;margin-bottom:4px;}',
+        '.fs-sec{margin-top:13px;}',
+        '.fs-sec-h{font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;',
+        'opacity:.55;font-weight:600;margin-bottom:4px;}',
+        '.fs-bar{height:10px;border-radius:5px;background:var(--fs-track);',
+        'overflow:hidden;max-width:560px;}',
+        '.fs-bar>i{display:block;height:100%;border-radius:5px;}',
+        '.fs-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;}',
+        '.fs-tile{border:1px solid var(--fs-soft);border-radius:4px;padding:6px 9px 7px;}',
+        '.fs-tile-l{font-size:11px;opacity:.62;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+        '.fs-tile-v{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.3;}',
+        '.fs-tile-v small{font-size:11px;font-weight:400;opacity:.6;margin-left:2px;}',
+        '.fs-tile-p{font-size:10.5px;opacity:.5;white-space:nowrap;font-variant-numeric:tabular-nums;}',
+        '.fs-tile svg{display:block;margin-top:2px;}',
+        '.fs-tbl{width:100%;border-collapse:collapse;font-size:12px;}',
+        '.fs-tbl th{text-align:left;font-weight:600;font-size:10.5px;opacity:.6;',
+        'padding:0 10px 3px 0;white-space:nowrap;border-bottom:1px solid var(--fs-soft);}',
+        '.fs-tbl th.fs-s{cursor:pointer;}.fs-tbl th.fs-s:hover{opacity:.95;}',
+        '.fs-tbl td{padding:3px 10px 3px 0;border-bottom:1px solid var(--fs-soft);}',
+        '.fs-tbl tr:last-child td{border-bottom:none;}',
+        '.fs-tbl tbody tr:hover td{background:var(--fs-fill);}',
+        '.fs-num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;}',
+        // Guest and volume are the two columns that wreck row rhythm: a
+        // guest label carries VMID + name + node, and a CSI volume name is 48
+        // characters. Both stay on one line; the volume truncates with its
+        // full value in a tooltip.
+        '.fs-tbl td.fs-g{white-space:nowrap;}',
+        '.fs-tbl td.fs-v{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+        '.fs-tile-p{overflow:hidden;text-overflow:ellipsis;}',
+        '.fs-w100{width:100%;}',
+        '.fs-pill{display:inline-block;font-size:10px;padding:0 5px;border-radius:8px;',
+        'border:1px solid var(--fs-line);opacity:.75;white-space:nowrap;margin-left:4px;}',
+        '.fs-alert{border:1px solid var(--fs-crit);border-radius:5px;padding:7px 10px;margin-top:10px;}',
+        '.fs-alert-h{font-weight:600;font-size:12px;margin-bottom:4px;}',
+        '.fs-note{font-size:11px;opacity:.6;margin-top:8px;max-width:700px;}',
+        '.fs-ev{font-size:11.5px;opacity:.72;margin-left:20px;font-variant-numeric:tabular-nums;}',
+        '.fs-err{color:var(--fs-crit);}',
+    ].join(''),
+
+    // Idempotent: the panel re-renders constantly and the installer appends
+    // this file once per node, but a reload must not stack stylesheets.
+    ensureStyles: function() {
+        try {
+            if (document.getElementById('fs-plugin-styles')) { return; }
+            let el = document.createElement('style');
+            el.id = 'fs-plugin-styles';
+            el.textContent = this.CSS;
+            document.head.appendChild(el);
+        } catch (err) {
+            // No document (tests) or a locked-down head — the panel degrades
+            // to unstyled markup, which is still readable.
+        }
+    },
 
     esc: Ext.htmlEncode,
 
     bytes: function(v) {
         if (v === undefined || v === null) { return '&ndash;'; }
-        return Proxmox.Utils.format_size(v);
+        return Ext.htmlEncode(Proxmox.Utils.format_size(v));
+    },
+
+    // Thousands separators matter here: five- and six-figure IOPS are the
+    // normal reading, and an unseparated 106400 is genuinely hard to size up
+    // at a glance against a peak of 1064.
+    num: function(v) {
+        if (v === undefined || v === null) { return '&ndash;'; }
+        let n = Number(v);
+        if (!isFinite(n)) { return Ext.htmlEncode(String(v)); }
+        return Ext.htmlEncode(n.toLocaleString(undefined, { maximumFractionDigits: 2 }));
     },
 
     // Storage Virtualize timestamps are YYMMDDHHMMSS, for both event log and
     // statistic peak times.
+    //
+    // Peaks get the time alone: stat_peak covers the last FIVE MINUTES, so the
+    // date is always today and always redundant - and printing it was what
+    // pushed the peak line out of its tile.
+    stampTime: function(t) {
+        let m = /^\d{6}(\d{2})(\d{2})(\d{2})$/.exec(String(t || ''));
+        return m ? `${m[1]}:${m[2]}:${m[3]}` : this.stamp(t);
+    },
+
     stamp: function(t) {
         let m = /^(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(String(t || ''));
         if (!m) { return t ? Ext.htmlEncode(String(t)) : ''; }
@@ -479,7 +586,7 @@ Ext.define('PVE.FlashSystemUI', {
         if (info.name) { bits.push(e(info.name)); }
         if (info.node) { bits.push(e(info.node)); }
         if (!bits.length) { return String(vmid); }
-        return `${vmid} <span style="color:#888;">(${bits.join(' &middot; ')})</span>`;
+        return `${vmid} <span class="fs-muted">${bits.join(' &middot; ')}</span>`;
     },
 
     sortRows: function(rows, key, dir) {
@@ -496,21 +603,30 @@ Ext.define('PVE.FlashSystemUI', {
     // Clickable column header. The panel owns the sort state and re-renders;
     // if the delegated handler never fires the table still shows the
     // server's ordering, which is already highest-first.
-    th: function(label, key, tableId, state) {
+    th: function(label, key, tableId, state, cls) {
         let e = Ext.htmlEncode;
         let active = state && state.key === key;
         let caret = active ? (state.dir === 'asc' ? ' &#9650;' : ' &#9660;') : '';
-        return `<th style="text-align:left;padding:2px 12px 4px 0;color:#888;font-weight:normal;`
-            + `cursor:pointer;white-space:nowrap;" data-fssort="${e(key)}" data-fstable="${e(tableId)}">`
-            + `${e(label)}${caret}</th>`;
+        return `<th class="fs-s${cls ? ' ' + cls : ''}" data-fssort="${e(key)}"`
+            + ` data-fstable="${e(tableId)}">${e(label)}${caret}</th>`;
     },
 
     fillBar: function(pct) {
         let p = Math.max(0, Math.min(100, Number(pct) || 0));
-        let color = p >= 90 ? '#c0392b' : (p >= 75 ? '#c87f0a' : '#2d7d46');
-        return `<span style="display:inline-block;vertical-align:middle;width:60px;height:8px;`
-            + `background:#2a2a2a;border:1px solid #555;border-radius:2px;margin-right:6px;">`
-            + `<span style="display:block;width:${p}%;height:100%;background:${color};"></span></span>${p}%`;
+        let v = p >= 90 ? 'var(--fs-crit)' : (p >= 75 ? 'var(--fs-warn)' : 'var(--fs-ok)');
+        return `<span class="fs-bar" style="width:64px;display:inline-block;vertical-align:middle;`
+            + `height:8px;margin-right:6px;"><i style="width:${p}%;background:${v};"></i></span>`
+            + `<span class="fs-num">${p}%</span>`;
+    },
+
+    icon: function(kind) {
+        let map = {
+            ok: 'fa-check-circle fs-ok',
+            warn: 'fa-exclamation-triangle fs-warn',
+            crit: 'fa-exclamation-triangle fs-crit',
+            info: 'fa-info-circle fs-muted',
+        };
+        return `<i class="fa ${map[kind] || map.info}"></i> `;
     },
 
     // Ranked consumers. `top` is the API's per-pool (or per-storage) block.
@@ -518,6 +634,7 @@ Ext.define('PVE.FlashSystemUI', {
         let me = this;
         let e = Ext.htmlEncode;
         if (!top) { return ''; }
+        me.ensureStyles();
         let idx = me.vmIndex();
         let h = [];
 
@@ -529,15 +646,13 @@ Ext.define('PVE.FlashSystemUI', {
         // while it is actually waiting on recovervdisk.
         let att = top.attention || [];
         if (att.length) {
-            h.push(`<div style="margin-top:8px;padding:6px 8px;border:1px solid #c0392b;`
-                + `border-radius:3px;">`
-                + '<i class="fa fa-exclamation-triangle" style="color:#c0392b;"></i> '
-                + `<b>${e(gettext('Needs attention'))}</b>`
+            h.push('<div class="fs-alert"><div class="fs-alert-h fs-crit">'
+                + me.icon('crit') + e(gettext('Needs attention'))
                 + (top.attention_total > att.length
-                    ? ` <span style="color:#888;">(${e(gettext('showing'))} ${att.length} `
+                    ? ` <span class="fs-muted">(${e(gettext('showing'))} ${att.length} `
                       + `${e(gettext('of'))} ${top.attention_total})</span>`
                     : '')
-                + '<table style="font-size:12px;margin-top:4px;"><tbody>');
+                + '</div><table class="fs-tbl"><tbody>');
             att.forEach(function(v) {
                 let flags = [];
                 if (v.status && String(v.status).toLowerCase() !== 'online') {
@@ -550,11 +665,11 @@ Ext.define('PVE.FlashSystemUI', {
                         + ' &mdash; ' + e(gettext('needs recovervdisk')));
                 }
                 h.push('<tr>'
-                    + `<td style="padding:1px 12px 1px 0;">${me.vmLabel(v.vmid, idx)}</td>`
-                    + `<td style="padding:1px 12px 1px 0;">${e(v.name || '')}</td>`
-                    + `<td style="padding:1px 12px 1px 0;color:#888;">${e(v.storage || '')}</td>`
-                    + `<td style="padding:1px 12px 1px 0;">${me.bytes(v.capacity)}</td>`
-                    + `<td style="padding:1px 0;color:#c0392b;">${flags.join(' &middot; ')}</td>`
+                    + `<td class="fs-g">${me.vmLabel(v.vmid, idx)}</td>`
+                    + `<td class="fs-v" title="${e(v.name || '')}">${e(v.name || '')}</td>`
+                    + `<td class="fs-muted">${e(v.storage || '')}</td>`
+                    + `<td class="fs-num">${me.bytes(v.capacity)}</td>`
+                    + `<td class="fs-crit">${flags.join(' &middot; ')}</td>`
                     + '</tr>');
             });
             h.push('</tbody></table></div>');
@@ -567,36 +682,37 @@ Ext.define('PVE.FlashSystemUI', {
             // allocated volume reserves its whole size, so the array has no
             // "how full" to report and the number that matters is the size.
             let anyFill = vols.some(function(v) { return v.fill_pct !== undefined; });
-            h.push('<table style="font-size:12px;width:100%;margin-top:6px;"><thead><tr>');
-            h.push(me.th(gettext('VM'), 'vmid', tableId, state));
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">${e(gettext('Largest volumes'))}</div>`);
+            h.push('<table class="fs-tbl fs-w100"><thead><tr>');
+            h.push(me.th(gettext('Guest'), 'vmid', tableId, state));
             h.push(me.th(gettext('Volume'), 'name', tableId, state));
             h.push(me.th(gettext('Storage'), 'storage', tableId, state));
-            h.push(me.th(gettext('Provisioned'), 'capacity', tableId, state));
+            h.push(me.th(gettext('Provisioned'), 'capacity', tableId, state, 'fs-num'));
             if (anyFill) { h.push(me.th(gettext('Used'), 'used', tableId, state)); }
             h.push('</tr></thead><tbody>');
             vols.forEach(function(v) {
                 h.push('<tr>'
-                    + `<td style="padding:1px 12px 1px 0;">${me.vmLabel(v.vmid, idx)}</td>`
-                    + `<td style="padding:1px 12px 1px 0;">${e(v.name || '')}`
+                    + `<td class="fs-g">${me.vmLabel(v.vmid, idx)}</td>`
+                    + `<td class="fs-v" title="${e(v.name || '')}">${e(v.name || '')}`
                         + (v.status && String(v.status).toLowerCase() !== 'online'
-                            ? ` <span style="color:#c0392b;">${e(v.status)}</span>` : '')
-                        + (v.thin ? ` <span style="color:#888;">${e(gettext('thin'))}</span>` : '')
+                            ? ` <span class="fs-crit">${e(v.status)}</span>` : '')
+                        + (v.thin ? `<span class="fs-pill">${e(gettext('thin'))}</span>` : '')
                     + '</td>'
-                    + `<td style="padding:1px 12px 1px 0;color:#888;">${e(v.storage || '')}</td>`
-                    + `<td style="padding:1px 12px 1px 0;">${me.bytes(v.capacity)}</td>`
+                    + `<td class="fs-muted">${e(v.storage || '')}</td>`
+                    + `<td class="fs-num">${me.bytes(v.capacity)}</td>`
                     + (anyFill
-                        ? `<td style="padding:1px 0;">`
+                        ? '<td>'
                             + (v.fill_pct === undefined
-                                ? '<span style="color:#888;">&ndash;</span>'
-                                : `${me.fillBar(v.fill_pct)} <span style="color:#888;">${me.bytes(v.used)} `
-                               + e(v.fill_basis === 'allocated'
-                                   ? gettext('of allocated')
-                                   : gettext('of provisioned')) + '</span>')
+                                ? '<span class="fs-dim">&ndash;</span>'
+                                : `${me.fillBar(v.fill_pct)} <span class="fs-muted">${me.bytes(v.used)} `
+                                  + e(v.fill_basis === 'allocated'
+                                      ? gettext('of allocated')
+                                      : gettext('of provisioned')) + '</span>')
                             + '</td>'
                         : '')
                     + '</tr>');
             });
-            h.push('</tbody></table>');
+            h.push('</tbody></table></div>');
         }
 
         let fill = top.fill;
@@ -605,27 +721,26 @@ Ext.define('PVE.FlashSystemUI', {
                 // The important one: every pmcl01 tier is a DRP.
                 'data-reduction-pool': gettext(
                     'Per-volume fill is not reported for volumes in a data reduction pool '
-                    + '- the array leaves those fields blank. Sizes below are provisioned capacity.'),
-                'query-failed': gettext('The per-volume fill query failed; sizes below are provisioned capacity.'),
+                    + '- the array leaves those fields blank. Sizes above are provisioned capacity.'),
+                'query-failed': gettext('The per-volume fill query failed; sizes above are provisioned capacity.'),
                 'pool-capacity-unavailable': gettext(
                     'Pool capacity was unavailable, so per-volume fill was not queried.'),
             }[fill.reason] || gettext('Per-volume fill is unavailable.');
-            h.push(`<div style="margin-top:6px;font-size:11px;color:#888;max-width:640px;">`
-                + '<i class="fa fa-info-circle"></i> ' + e(why) + '</div>');
+            h.push(`<div class="fs-note">${me.icon('info')}${e(why)}</div>`);
         }
 
         let vms = top.vms || [];
         if (vms.length > 1) {
-            h.push(`<div style="color:#888;font-size:12px;margin-top:10px;">${e(gettext('By guest'))}</div>`);
-            h.push('<table style="font-size:12px;margin-top:2px;"><tbody>');
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">${e(gettext('By guest'))}</div>`);
+            h.push('<table class="fs-tbl"><tbody>');
             vms.forEach(function(v) {
                 h.push('<tr>'
-                    + `<td style="padding:1px 12px 1px 0;">${me.vmLabel(v.vmid, idx)}</td>`
-                    + `<td style="padding:1px 12px 1px 0;color:#888;">${Number(v.disks) || 0} ${e(gettext('disks'))}</td>`
-                    + `<td style="padding:1px 0;">${me.bytes(v.capacity)}</td>`
+                    + `<td class="fs-g">${me.vmLabel(v.vmid, idx)}</td>`
+                    + `<td class="fs-muted">${Number(v.disks) || 0} ${e(gettext('disks'))}</td>`
+                    + `<td class="fs-num">${me.bytes(v.capacity)}</td>`
                     + '</tr>');
             });
-            h.push('</tbody></table>');
+            h.push('</tbody></table></div>');
         }
 
         // Other storages of OURS sharing this pool. Only the storage-scoped
@@ -634,10 +749,10 @@ Ext.define('PVE.FlashSystemUI', {
         // question to the storage team that belonged to our own Kubernetes.
         let sib = top.siblings;
         if (sib && sib.count) {
-            h.push(`<div style="color:#888;font-size:12px;margin-top:10px;">`
+            h.push(`<div class="fs-note">`
                 + `${e(gettext('Other storages of this cluster in the same pool'))}: `
                 + `<b>${sib.count}</b> ${e(gettext('volumes'))}, ${me.bytes(sib.capacity)} `
-                + `<span style="color:#666;">(${e(gettext('see Datacenter → FlashSystem for the breakdown'))})</span>`
+                + `<span class="fs-dim">(${e(gettext('see Datacenter → FlashSystem for the breakdown'))})</span>`
                 + '</div>');
         }
 
@@ -646,14 +761,20 @@ Ext.define('PVE.FlashSystemUI', {
         // operator at the wrong place entirely.
         let f = top.foreign;
         if (f && f.count) {
-            h.push(`<div style="color:#888;font-size:12px;margin-top:10px;">`
-                + `${e(gettext('Not managed by this cluster'))}: <b>${f.count}</b> `
-                + `${e(gettext('volumes'))}, ${me.bytes(f.capacity)}</div>`);
-            (f.volumes || []).forEach(function(v) {
-                if (!v.name) { return; }
-                h.push(`<div style="font-size:12px;color:#888;margin-left:14px;">`
-                    + `${e(v.name)} &nbsp; ${me.bytes(v.capacity)}</div>`);
-            });
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">`
+                + `${e(gettext('Not managed by this cluster'))}</div>`
+                + `<div class="fs-muted" style="font-size:12px;">`
+                + `<b>${f.count}</b> ${e(gettext('volumes'))}, ${me.bytes(f.capacity)}</div>`);
+            let named = (f.volumes || []).filter(function(v) { return v.name; });
+            if (named.length) {
+                h.push('<table class="fs-tbl"><tbody>');
+                named.forEach(function(v) {
+                    h.push(`<tr><td class="fs-v" title="${e(v.name)}">${e(v.name)}</td>`
+                        + `<td class="fs-num">${me.bytes(v.capacity)}</td></tr>`);
+                });
+                h.push('</tbody></table>');
+            }
+            h.push('</div>');
         }
         return h.join('');
     },
@@ -665,12 +786,12 @@ Ext.define('PVE.FlashSystemUI', {
     PERF_GROUPS: [
         { label: 'Volumes (front end)', spark: true, metrics: [
             { k: 'vdisk_r_io', l: 'Read IOPS' }, { k: 'vdisk_w_io', l: 'Write IOPS' },
-            { k: 'vdisk_r_mb', l: 'Read MB/s' }, { k: 'vdisk_w_mb', l: 'Write MB/s' },
+            { k: 'vdisk_r_mb', l: 'Read', u: 'MB/s' }, { k: 'vdisk_w_mb', l: 'Write', u: 'MB/s' },
             { k: 'vdisk_r_ms', l: 'Read latency' },
             { k: 'vdisk_w_ms', l: 'Write latency' } ] },
         { label: 'MDisks (back end)', metrics: [
             { k: 'mdisk_r_io', l: 'Read IOPS' }, { k: 'mdisk_w_io', l: 'Write IOPS' },
-            { k: 'mdisk_r_mb', l: 'Read MB/s' }, { k: 'mdisk_w_mb', l: 'Write MB/s' },
+            { k: 'mdisk_r_mb', l: 'Read', u: 'MB/s' }, { k: 'mdisk_w_mb', l: 'Write', u: 'MB/s' },
             { k: 'mdisk_r_ms', l: 'Read latency' },
             { k: 'mdisk_w_ms', l: 'Write latency' } ] },
         { label: 'Drives', metrics: [
@@ -678,9 +799,9 @@ Ext.define('PVE.FlashSystemUI', {
             { k: 'drive_r_ms', l: 'Read latency' },
             { k: 'drive_w_ms', l: 'Write latency' } ] },
         { label: 'Interfaces', metrics: [
-            { k: 'fc_io', l: 'FC IOPS' }, { k: 'fc_mb', l: 'FC MB/s' },
-            { k: 'iscsi_io', l: 'iSCSI IOPS' }, { k: 'iscsi_mb', l: 'iSCSI MB/s' },
-            { k: 'sas_io', l: 'SAS IOPS' }, { k: 'sas_mb', l: 'SAS MB/s' } ] },
+            { k: 'fc_io', l: 'FC IOPS' }, { k: 'fc_mb', l: 'FC', u: 'MB/s' },
+            { k: 'iscsi_io', l: 'iSCSI IOPS' }, { k: 'iscsi_mb', l: 'iSCSI', u: 'MB/s' },
+            { k: 'sas_io', l: 'SAS IOPS' }, { k: 'sas_mb', l: 'SAS', u: 'MB/s' } ] },
         { label: 'System', metrics: [
             { k: 'cpu_pc', l: 'CPU', u: '%' },
             { k: 'compression_cpu_pc', l: 'Compression CPU', u: '%' },
@@ -689,8 +810,8 @@ Ext.define('PVE.FlashSystemUI', {
             { k: 'power_w', l: 'Power', u: 'W' }, { k: 'temp_c', l: 'Temperature', u: 'C' } ] },
     ],
 
-    // Inline SVG — no library, no external fetch (the GUI is served from the
-    // node and a CSP-safe inline element is the whole budget here).
+    // Inline SVG — no library, no external fetch, and it inherits the theme's
+    // text colour through currentColor rather than picking one.
     sparkline: function(values) {
         if (!values || values.length < 2) { return ''; }
         let nums = values.map(Number).filter(function(v) { return isFinite(v); });
@@ -698,14 +819,15 @@ Ext.define('PVE.FlashSystemUI', {
         let max = Math.max.apply(null, nums);
         let min = Math.min.apply(null, nums);
         let span = (max - min) || 1;
-        let w = 90, hh = 18;
+        let w = 100, hh = 16;
         let step = w / (nums.length - 1);
         let pts = nums.map(function(v, i) {
             return (i * step).toFixed(1) + ',' + (hh - ((v - min) / span) * hh).toFixed(1);
         }).join(' ');
-        return `<svg width="${w}" height="${hh}" style="vertical-align:middle;" `
-            + `viewBox="0 0 ${w} ${hh}" preserveAspectRatio="none">`
-            + `<polyline points="${pts}" fill="none" stroke="#5a9fd4" stroke-width="1.5"/></svg>`;
+        return `<svg width="100%" height="${hh}" viewBox="0 0 ${w} ${hh}" `
+            + `preserveAspectRatio="none" style="opacity:.75;">`
+            + `<polyline points="${pts}" fill="none" stroke="var(--fs-accent)" `
+            + `stroke-width="1.5" vector-effect="non-scaling-stroke"/></svg>`;
     },
 
     renderPerformance: function(d) {
@@ -713,17 +835,18 @@ Ext.define('PVE.FlashSystemUI', {
         let e = Ext.htmlEncode;
         let h = [];
         if (!d || d.error) {
-            return '<div style="color:#c0392b;">' + ((d && d.error) || e(gettext('Query failed'))) + '</div>';
+            return `<div class="fs-err">${(d && d.error) || e(gettext('Query failed'))}</div>`;
         }
+        me.ensureStyles();
         let stats = (d.performance && d.performance.stats) || {};
         let hist = d.history || {};
-
         let nodeRows = (d.nodes && d.nodes.nodes) || [];
+
         // Only claim nothing was reported when nothing was. Printing this
         // above a per-canister table full of live numbers reads as a bug in
         // the panel rather than as a partial answer.
         if (!Object.keys(stats).length && !nodeRows.length) {
-            h.push(`<div style="color:#888;">${e(gettext('No performance statistics reported.'))}</div>`);
+            h.push(`<div class="fs-muted">${e(gettext('No performance statistics reported.'))}</div>`);
         }
 
         // Two things the reader has to know to trust these numbers.
@@ -748,47 +871,53 @@ Ext.define('PVE.FlashSystemUI', {
         me.PERF_GROUPS.forEach(function(g) {
             let rows = g.metrics.filter(function(m) { return stats[m.k] !== undefined; });
             if (!rows.length) { return; }
-            h.push(`<div style="margin-top:12px;"><b style="font-size:12px;">${e(gettext(g.label))}</b>`);
-            h.push('<table style="font-size:12px;margin-top:2px;"><tbody>');
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">${e(gettext(g.label))}</div>`);
+            h.push('<div class="fs-tiles">');
             rows.forEach(function(m) {
                 let s = stats[m.k];
-                let unit = m.u ? ' ' + e(m.u) : '';
-                h.push('<tr>'
-                    + `<td style="padding:1px 14px 1px 0;color:#888;white-space:nowrap;">${e(gettext(m.l))}</td>`
-                    + `<td style="padding:1px 14px 1px 0;text-align:right;"><b>`
-                        + (s.current === undefined || s.current === null ? '&ndash;' : e(String(s.current)))
-                        + `</b>${unit}</td>`
-                    + `<td style="padding:1px 14px 1px 0;color:#888;white-space:nowrap;">`
+                h.push('<div class="fs-tile">'
+                    + `<div class="fs-tile-l">${e(gettext(m.l))}</div>`
+                    + `<div class="fs-tile-v">${me.num(s.current)}`
+                        + (m.u ? `<small>${e(m.u)}</small>` : '') + '</div>'
+                    + '<div class="fs-tile-p">'
                         + (s.peak === undefined || s.peak === null
-                            ? ''
-                            : `${e(gettext('peak'))} ${e(String(s.peak))}${unit}`
-                              + (s.peak_time ? ` ${e(gettext('at'))} ${me.stamp(s.peak_time)}` : ''))
-                    + '</td>'
-                    + `<td style="padding:1px 0;">${g.spark ? me.sparkline(hist[m.k]) : ''}</td>`
-                    + '</tr>');
+                            ? '&nbsp;'
+                            : `${e(gettext('peak'))} ${me.num(s.peak)}`
+                              + (s.peak_time ? ` &middot; ${me.stampTime(s.peak_time)}` : ''))
+                    + '</div>'
+                    + (g.spark ? me.sparkline(hist[m.k]) : '')
+                    + '</div>');
             });
-            h.push('</tbody></table></div>');
+            h.push('</div></div>');
         });
 
         // Per-canister. An imbalance here is the clearest single signal that
         // one node is the bottleneck rather than the array as a whole.
-        let nodes = nodeRows;
-        if (nodes.length) {
-            h.push(`<div style="margin-top:12px;"><b style="font-size:12px;">${e(gettext('Nodes'))}</b>`);
-            h.push('<table style="font-size:12px;margin-top:2px;"><tbody>');
-            nodes.forEach(function(n) {
+        if (nodeRows.length) {
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">${e(gettext('Nodes'))}</div>`);
+            h.push('<table class="fs-tbl"><thead><tr>'
+                + `<th>${e(gettext('Canister'))}</th>`
+                + `<th class="fs-num">${e(gettext('CPU'))}</th>`
+                + `<th class="fs-num">${e(gettext('Cache'))}</th>`
+                + `<th class="fs-num">${e(gettext('Write cache'))}</th>`
+                + `<th class="fs-num">${e(gettext('Latency'))}</th>`
+                + `<th class="fs-num">${e(gettext('IOPS'))}</th>`
+                + '</tr></thead><tbody>');
+            nodeRows.forEach(function(n) {
                 let st = n.stats || {};
                 let cell = function(k, unit) {
                     let v = st[k];
                     return v === undefined || v.current === undefined || v.current === null
-                        ? '&ndash;' : e(String(v.current)) + (unit || '');
+                        ? '<span class="fs-dim">&ndash;</span>'
+                        : me.num(v.current) + (unit || '');
                 };
                 h.push('<tr>'
-                    + `<td style="padding:1px 14px 1px 0;"><b>${e(n.node)}</b></td>`
-                    + `<td style="padding:1px 14px 1px 0;color:#888;">${e(gettext('CPU'))} ${cell('cpu_pc', '%')}</td>`
-                    + `<td style="padding:1px 14px 1px 0;color:#888;">${e(gettext('Cache'))} ${cell('total_cache_pc', '%')}</td>`
-                    + `<td style="padding:1px 14px 1px 0;color:#888;">${e(gettext('Latency'))} ${cell('vdisk_ms')}</td>`
-                    + `<td style="padding:1px 0;color:#888;">${e(gettext('IOPS'))} ${cell('vdisk_io')}</td>`
+                    + `<td><b>${e(n.node)}</b></td>`
+                    + `<td class="fs-num">${cell('cpu_pc', '%')}</td>`
+                    + `<td class="fs-num">${cell('total_cache_pc', '%')}</td>`
+                    + `<td class="fs-num">${cell('write_cache_pc', '%')}</td>`
+                    + `<td class="fs-num">${cell('vdisk_ms')}</td>`
+                    + `<td class="fs-num">${cell('vdisk_io')}</td>`
                     + '</tr>');
             });
             h.push('</tbody></table></div>');
@@ -798,30 +927,39 @@ Ext.define('PVE.FlashSystemUI', {
         // the one "why is this slow" answer the array can give outright.
         let thr = d.throttles;
         if (thr && thr.total) {
-            h.push(`<div style="margin-top:12px;"><b style="font-size:12px;">${e(gettext('Throttles'))}</b>`);
-            h.push('<table style="font-size:12px;margin-top:2px;"><tbody>');
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">${e(gettext('Throttles'))}</div>`);
+            h.push('<table class="fs-tbl"><thead><tr>'
+                + `<th>${e(gettext('Object'))}</th><th>${e(gettext('Type'))}</th>`
+                + `<th class="fs-num">${e(gettext('IOPS limit'))}</th>`
+                + `<th class="fs-num">${e(gettext('Bandwidth'))}</th>`
+                + '</tr></thead><tbody>');
             (thr.throttles || []).forEach(function(t) {
                 h.push('<tr>'
-                    + `<td style="padding:1px 14px 1px 0;">${e(t.object_name || t.throttle_name || '')}</td>`
-                    + `<td style="padding:1px 14px 1px 0;color:#888;">${e(t.throttle_type || '')}</td>`
-                    + `<td style="padding:1px 14px 1px 0;">`
-                        + (t.IOPs_limit ? `${e(String(t.IOPs_limit))} ${e(gettext('IOPS'))}` : '')
+                    + `<td>${e(t.object_name || t.throttle_name || '')}</td>`
+                    + `<td class="fs-muted">${e(t.throttle_type || '')}</td>`
+                    + '<td class="fs-num">'
+                        + (t.IOPs_limit ? me.num(t.IOPs_limit) : '<span class="fs-dim">&ndash;</span>')
                     + '</td>'
-                    + `<td style="padding:1px 0;">`
-                        + (t.bandwidth_limit_MB ? `${e(String(t.bandwidth_limit_MB))} MB/s` : '')
+                    + '<td class="fs-num">'
+                        + (t.bandwidth_limit_MB
+                            ? me.num(t.bandwidth_limit_MB) + ' MB/s'
+                            : '<span class="fs-dim">&ndash;</span>')
                     + '</td></tr>');
             });
-            h.push('</tbody></table></div>');
+            h.push('</tbody></table>'
+                + `<div class="fs-note">${me.icon('info')}`
+                + e(gettext('Throttle limits are per node, so the effective ceiling is '
+                    + 'higher than the figure shown.')) + '</div></div>');
         }
 
         notes.forEach(function(n) {
-            h.push(`<div style="margin-top:8px;font-size:11px;color:#888;max-width:640px;">`
-                + '<i class="fa fa-info-circle"></i> ' + e(n) + '</div>');
+            h.push(`<div class="fs-note">${me.icon('info')}${e(n)}</div>`);
         });
 
         if (d.errors) {
-            h.push(`<div style="margin-top:10px;font-size:12px;color:#c87f0a;">`
-                + e(gettext('Sections unavailable')) + ': ' + e(Object.keys(d.errors).join(', ')) + '</div>');
+            h.push(`<div class="fs-note fs-warn">${me.icon('warn')}`
+                + e(gettext('Sections unavailable')) + ': '
+                + e(Object.keys(d.errors).join(', ')) + '</div>');
         }
         return h.join('');
     },
@@ -917,111 +1055,123 @@ Ext.define('PVE.dc.FlashSystemOverview', {
     renderArray: function(d, arrIdx) {
         let me = this;
         let e = me.esc;
+        let UI = PVE.FlashSystemUI;
         let h = [];
         if (!d || d.error) {
             // d.error is response.htmlStatus, already encoded by the toolkit.
-            return '<div style="color:#c0392b;margin-bottom:18px;">'
-                + ((d && d.error) || e(gettext('Query failed'))) + '</div>';
+            return '<div class="fs-root"><div class="fs-err" style="margin-bottom:18px;">'
+                + ((d && d.error) || e(gettext('Query failed'))) + '</div></div>';
         }
+        UI.ensureStyles();
         let sys = d.system || {};
 
-        h.push('<div style="margin-bottom:22px;">');
-        h.push(`<h2 style="margin:0 0 2px;font-size:16px;">${e(sys.name || d.array || 'FlashSystem')}</h2>`);
+        h.push('<div class="fs-root"><div class="fs-array">');
+        h.push(`<div class="fs-title">${e(sys.name || d.array || 'FlashSystem')}</div>`);
         let sub = [];
         if (sys.product_name) { sub.push(e(sys.product_name)); }
         if (sys.code_level) { sub.push(e(gettext('Firmware')) + ' ' + e(sys.code_level)); }
         if (d.array) { sub.push(e(d.array)); }
-        h.push(`<div style="color:#888;margin-bottom:12px;">${sub.join(' &middot; ')}</div>`);
+        h.push(`<div class="fs-sub">${sub.join(' &middot; ')}</div>`);
 
-        // ports + alerts, one line each — array-wide facts
+        // Array-wide facts on one status line each.
+        h.push('<div class="fs-status">');
         if (d.ports) {
             let ok = d.ports.active === d.ports.total;
-            h.push(`<div style="margin-bottom:4px;">`
-                + (ok ? '<i class="fa fa-check" style="color:#2d7d46;"></i> '
-                      : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> ')
-                + `${d.ports.active} / ${d.ports.total} ${e(gettext('FC ports active'))}</div>`);
+            h.push('<span>' + UI.icon(ok ? 'ok' : 'warn')
+                + `${d.ports.active} / ${d.ports.total} ${e(gettext('FC ports active'))}</span>`);
         }
         if (d.events) {
             let alerts = d.events.alerts || 0;
-            h.push('<div style="margin-bottom:10px;">'
+            h.push('<span>'
                 + (alerts === 0
-                    ? '<i class="fa fa-check" style="color:#2d7d46;"></i> ' + e(gettext('No unfixed alerts'))
-                    : `<i class="fa fa-exclamation-triangle" style="color:#c0392b;"></i> <b>${alerts}</b> ${e(gettext('unfixed alerts'))}`)
+                    ? UI.icon('ok') + e(gettext('No unfixed alerts'))
+                    : UI.icon('crit') + `<b>${alerts}</b> ${e(gettext('unfixed alerts'))}`)
                 // Only shown when the whole unfixed log was fetched. Under the
                 // server-side alert filter the informational events are not in
                 // the payload, and printing 0 would claim there are none.
                 + (d.events.unfixed_total === undefined
                     ? ''
-                    : ` <span style="color:#888;">(${d.events.unfixed_total} ${e(gettext('events array-wide, incl. informational'))})</span>`)
-                + '</div>');
-            (d.events.recent || []).forEach(function(ev) {
-                h.push('<div style="font-size:12px;color:#888;margin-left:18px;">'
-                    + `${e(me.fmtEventTime(ev.last_timestamp))} &nbsp; <b>${e(ev.error_code || '')}</b> `
-                    + `${e(ev.description || '')}`
-                    + (ev.object_name ? ` (${e(ev.object_name)})` : '') + '</div>');
-            });
+                    : ` <span class="fs-muted">(${d.events.unfixed_total} `
+                      + `${e(gettext('events array-wide, incl. informational'))})</span>`)
+                + '</span>');
         }
+        h.push('</div>');
+
+        (d.events && d.events.recent ? d.events.recent : []).forEach(function(ev) {
+            h.push('<div class="fs-ev">'
+                + `${e(me.fmtEventTime(ev.last_timestamp))} &nbsp; `
+                + `<b class="fs-crit">${e(ev.error_code || '')}</b> ${e(ev.description || '')}`
+                + (ev.object_name ? ` <span class="fs-dim">(${e(ev.object_name)})</span>` : '')
+                + '</div>');
+        });
 
         // one card per pool, listing the storages that share it
         (d.pools || []).forEach(function(p, poolIdx) {
             let c = p.capacity || {};
             let known = c.provision_total !== undefined;
             let pct = known ? (c.provision_used_pct || 0) : 0;
-            let color = pct >= 90 ? '#c0392b' : (pct >= 75 ? '#c87f0a' : '#2d7d46');
-            h.push('<div style="margin-top:16px;padding:10px 12px;border:1px solid #444;border-radius:4px;">');
-            h.push(`<div style="display:flex;justify-content:space-between;margin-bottom:6px;">`
+            let v = pct >= 90 ? 'var(--fs-crit)' : (pct >= 75 ? 'var(--fs-warn)' : 'var(--fs-ok)');
+            h.push('<div class="fs-card">');
+            h.push('<div class="fs-card-h">'
                 + `<b>${e(p.pool || '')}</b>`
-                + `<span style="color:#888;">`
-                + (known ? `${pct}% ${e(gettext('of physical'))}` : e(gettext('unavailable')))
-                + (c.data_reduction === 'yes' ? ' &middot; ' + e(gettext('data reduction')) : '')
-                + `</span></div>`);
-            h.push(`<div style="max-width:520px;background:#2a2a2a;border:1px solid #555;border-radius:3px;height:14px;">`
-                + `<div style="background:${color};width:${Math.min(pct, 100)}%;height:100%;border-radius:2px;"></div></div>`);
-            h.push(`<div style="color:#888;font-size:12px;margin:4px 0 8px;">`
-                + (c.provision_total === undefined
-                    ? '<i class="fa fa-question-circle"></i> ' + e(gettext('capacity unavailable'))
-                    : `${me.fmtBytes(c.provision_used)} / ${me.fmtBytes(c.provision_total)} `
-                      + `(${me.fmtBytes(c.provision_free)} ${e(gettext('free'))})`)
+                + '<span class="fs-muted">'
+                + (known ? `${pct}% ${e(gettext('of physical'))}` : e(gettext('capacity unavailable')))
+                + (c.data_reduction === 'yes'
+                    ? `<span class="fs-pill">${e(gettext('data reduction'))}</span>` : '')
+                + '</span></div>');
+            h.push(`<div class="fs-bar"><i style="width:${Math.min(pct, 100)}%;background:${v};"></i></div>`);
+            h.push('<div class="fs-muted" style="font-size:12px;margin:5px 0 0;">'
+                + (known
+                    ? `${UI.bytes(c.provision_used)} / ${UI.bytes(c.provision_total)} `
+                      + `&middot; ${UI.bytes(c.provision_free)} ${e(gettext('free'))}`
+                    : UI.icon('info') + e(gettext('capacity unavailable')))
                 + ' &middot; '
                 + (p.pool_volumes === undefined
                     ? e(gettext('volume count unavailable'))
                     : `${p.pool_volumes} ${e(gettext('volumes in pool'))}`)
                 + '</div>');
-            h.push('<table style="font-size:12px;width:100%;">');
-            (p.storages || []).forEach(function(s) {
+
+            h.push(`<div class="fs-sec"><div class="fs-sec-h">${e(gettext('Storages'))}</div>`);
+            h.push('<table class="fs-tbl fs-w100"><tbody>');
+            (p.storages || []).forEach(function(st) {
                 h.push('<tr>'
-                    + `<td style="padding:1px 12px 1px 0;"><b>${e(s.storage)}</b></td>`
-                    + `<td style="padding:1px 12px 1px 0;color:#888;">`
-                        + (s.prefix ? e(s.prefix)
-                            : '<i class="fa fa-exclamation-triangle" style="color:#c87f0a;"></i> ' + e(gettext('no prefix')))
+                    + `<td><b>${e(st.storage)}</b></td>`
+                    + '<td class="fs-muted">'
+                        + (st.prefix
+                            ? e(st.prefix)
+                            : UI.icon('warn') + e(gettext('no prefix')))
                     + '</td>'
-                    + `<td style="padding:1px 12px 1px 0;">`
-                        + (s.volumes === undefined ? '&ndash;' : `${Number(s.volumes) || 0} ${e(gettext('vols'))}`)
+                    + '<td class="fs-num">'
+                        + (st.volumes === undefined
+                            ? '<span class="fs-dim">&ndash;</span>'
+                            : `${Number(st.volumes) || 0} ${e(gettext('vols'))}`)
                     + '</td>'
-                    + `<td style="padding:1px 12px 1px 0;">`
-                        + (s.provisioned === undefined ? '&ndash;' : me.fmtBytes(s.provisioned))
+                    + '<td class="fs-num">'
+                        + (st.provisioned === undefined
+                            ? '<span class="fs-dim">&ndash;</span>'
+                            : UI.bytes(st.provisioned))
                     + '</td>'
-                    + `<td style="padding:1px 0;color:#888;">`
-                        + (s.thin ? e(gettext('thin')) : e(gettext('thick')))
-                        + (s.snapshots ? ' &middot; ' + e(gettext('snapshots')) : '')
+                    + '<td class="fs-muted">'
+                        + e(st.thin ? gettext('thin') : gettext('thick'))
+                        + (st.snapshots ? `<span class="fs-pill">${e(gettext('snapshots'))}</span>` : '')
                     + '</td></tr>');
             });
-            h.push('</table>');
+            h.push('</tbody></table></div>');
 
             // Ranked consumers — what is actually occupying this pool.
             if (p.top) {
-                let tid = `a${arrIdx}p${poolIdx}`;
-                h.push(PVE.FlashSystemUI.renderTop(p.top, tid, (me.sortState || {})[tid]));
+                h.push(UI.renderTop(p.top, `a${arrIdx}p${poolIdx}`,
+                    (me.sortState || {})[`a${arrIdx}p${poolIdx}`]));
             }
             h.push('</div>');
         });
 
         if (d.errors) {
-            h.push(`<div style="margin-top:10px;font-size:12px;color:#c87f0a;">`
+            h.push(`<div class="fs-note fs-warn">${UI.icon('warn')}`
                 + e(gettext('Sections unavailable')) + ': '
                 + e(Object.keys(d.errors).join(', ')) + '</div>');
         }
-        h.push('</div>');
+        h.push('</div></div>');
         return h.join('');
     },
 
@@ -1029,12 +1179,13 @@ Ext.define('PVE.dc.FlashSystemOverview', {
         let e = this.esc;
         let sys = (d && d.system) || {};
         let title = sys.name || (d && d.array) || `FlashSystem ${i + 1}`;
-        return '<div style="margin-bottom:18px;">'
-            + `<h2 style="margin:0 0 2px;font-size:16px;">${e(title)} &mdash; ${e(gettext('Performance'))}</h2>`
-            + `<div style="color:#888;font-size:12px;margin-bottom:4px;">`
+        PVE.FlashSystemUI.ensureStyles();
+        return '<div class="fs-root"><div class="fs-array">'
+            + `<div class="fs-title">${e(title)} &mdash; ${e(gettext('Performance'))}</div>`
+            + `<div class="fs-sub">`
             + e(gettext('Array-wide. Peak values cover the last five minutes.')) + '</div>'
             + PVE.FlashSystemUI.renderPerformance(d)
-            + '</div>';
+            + '</div></div>';
     },
 
     // Re-render one target from cached data — used both when a fetch lands
@@ -1079,7 +1230,7 @@ Ext.define('PVE.dc.FlashSystemOverview', {
         let me = this;
         let node = me.anyNode();
         if (!node) {
-            me.setHtml('caps', '<div>' + gettext('No online node found.') + '</div>');
+            me.setHtml('caps', '<div class="fs-root">' + gettext('No online node found.') + '</div>');
             me.setHtml('perf', '');
             return;
         }
@@ -1088,14 +1239,14 @@ Ext.define('PVE.dc.FlashSystemOverview', {
             method: 'GET',
             waitMsgTarget: me,
             failure: function(response) {
-                me.setHtml('caps', '<div style="color:#c0392b;">'
+                me.setHtml('caps', '<div class="fs-root fs-err">'
                     + (response.htmlStatus || Ext.htmlEncode(gettext('Query failed'))) + '</div>');
                 me.setHtml('perf', '');
             },
             success: function(response) {
                 let list = response.result.data || [];
                 if (!list.length) {
-                    me.setHtml('caps', '<div>' + gettext('No FlashSystem storages are configured.') + '</div>');
+                    me.setHtml('caps', '<div class="fs-root">' + gettext('No FlashSystem storages are configured.') + '</div>');
                     me.setHtml('perf', '');
                     return;
                 }
@@ -1108,7 +1259,7 @@ Ext.define('PVE.dc.FlashSystemOverview', {
                     if (!seen[key]) { seen[key] = true; reps.push(s.storage); }
                 });
                 me.fsReps = reps;
-                me.setHtml('perf', '<div>' + gettext('Loading...') + '</div>');
+                me.setHtml('perf', '<div class="fs-root fs-muted">' + gettext('Loading...') + '</div>');
                 me.fanout(node, reps, 'overview', 'capsData', 'caps');
                 me.fanout(node, reps, 'performance', 'perfData', 'perf');
             },

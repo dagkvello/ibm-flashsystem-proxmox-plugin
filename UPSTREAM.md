@@ -364,6 +364,29 @@ matters especially: it arrives *with* `status=online`, so a status column
 alone displays it as healthy when it actually needs `recovervdisk` before the
 guest will start.
 
+### Styling
+
+Both panels share one injected stylesheet rather than inline style attributes,
+and nothing in it hardcodes a light or a dark value. That is a correctness
+matter, not taste: PVE ships both themes, and the first cut had each panel
+broken under the opposite one — the datacenter panel painted dark greys
+(`#888` text, a `#2a2a2a` bar track) while the older health panel painted the
+reverse (an `#eee` bar with `#000` text, a white block on the dark theme).
+
+Two rules make it theme-proof without detecting the theme at all: text is
+`currentColor` and muted text is `opacity`, both relative to whatever the
+theme already chose; lines and fills are `rgba(128,128,128,a)`, a neutral grey
+that reads correctly over white and over near-black alike. Only four semantic
+hues are absolute, and they are used on icons and bars rather than on body
+text, so legibility never depends on them. `tests/t_gui.js` asserts no other
+absolute colour reaches the file.
+
+Performance renders as a tile grid — label, large value, peak with its time,
+sparkline — because the question it answers is "is anything wrong right now",
+which a dense table of numbers does not answer at a glance. Peaks print the
+time only: `stat_peak` covers the last five minutes, so the date is always
+today.
+
 **Known gap (inherited).** Both sections filter `lsvdisk` server-side on
 `mdisk_grp_name`, which does not match **mirrored** volumes — those report
 `many`. A mirrored volume is therefore missing from the pool's counts and
