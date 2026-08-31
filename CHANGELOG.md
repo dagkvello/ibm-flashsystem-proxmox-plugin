@@ -3,6 +3,34 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Unreleased — 2026-08-31
+
+- **Resize verifies the host device instead of assuming it.**
+  `expandvdisksize` returns before the array commits the new capacity to a
+  host `READ CAPACITY`, so a single immediate rescan races it and loses —
+  seen live on a 20G→50G production resize where all 8 paths still read the
+  old size, the plugin returned success, and QEMU failed the guest-side grow
+  with `Cannot grow device files`. Now polls to the requested size and dies
+  naming the array size, the device size, every path size and the recovery.
+  Background formatting is not the blocker: a manual rescan succeeded while
+  the array was still formatting at 44%.
+- **The failure message says DO NOT re-run the resize**, because PVE sizes
+  from `volume_size_info` (answered from the array, already grown) and the
+  GUI only sends increments — so retrying expands the volume a second time,
+  permanently. `activate_volume` now re-syncs capacity best-effort, making
+  stop/start or migrate the supported recovery; previously no operator
+  gesture reached host propagation at all.
+- `_dm_node` no longer assumes `/dev/mapper/<wwid>` is a symlink (it is a
+  real device node without udev), validates the result, falls back to
+  `/sys/block/dm-*/dm/name`, and fails immediately rather than after the
+  full settle budget. The dm node is re-resolved each iteration, so a map
+  reassembled underneath the loop cannot make it check the wrong device.
+- One `lsvdisk` per resize instead of two.
+- `$MAPPER_DIR` and `$RESIZE_SETTLE_TIMEOUT` are documented test seams:
+  the settle loop now runs against a fixture, and swapping
+  `_resize_host_device`'s parameters produces 10 test failures where the
+  previous tests stayed green.
+
 ## Unreleased — 2026-08-26
 
 - **Performance endpoint + Datacenter performance section**:

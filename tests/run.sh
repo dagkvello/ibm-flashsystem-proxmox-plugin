@@ -13,6 +13,7 @@ perl -I stub -c "$MOD"
 perl t_prefix.pl
 perl t_status.pl
 perl t_names.pl
+perl t_resize.pl
 perl t_api.pl
 
 # The GUI render helpers, executed against fixtures with a stubbed ExtJS.

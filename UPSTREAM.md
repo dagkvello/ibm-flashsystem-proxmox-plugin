@@ -217,6 +217,41 @@ arithmetic: had the filter applied, every row would be an alert, so a row
 count above the alert count means it did not, and the total is reported after
 all. The client-side alert/informational split remains either way.
 
+## Host-side resize propagation
+
+`expandvdisksize` returns as soon as the array accepts the request; the new
+capacity is not yet visible to a host `READ CAPACITY`. The sample code, and
+this plugin until v1.0.11, rescanned once immediately and accepted whatever
+came back — which is a race, and it loses. Observed live 2026-08-31: a
+20G→50G resize grew the array, every one of the 8 paths still read 20 GiB,
+the dm map followed them, `volume_resize` returned success, and QEMU failed
+the guest-side grow with `Cannot grow device files` — an error three layers
+from the cause, on a resize the array had already completed. A manual rescan
+minutes later worked instantly *while the array was still background-
+formatting at 44%*, which rules formatting out and leaves plain timing.
+
+`_resize_host_device` now checks first, and only if the device is behind does
+it rescan, resize the map and re-check, until the requested size is reached or
+a bounded budget expires — then it **dies**, naming the array size, the device
+size, every path size and the recovery. Failing loudly is the point.
+
+Two things this exposed that are easy to get wrong:
+
+**There is no safe operator retry.** PVE derives its base size from
+`volume_size_info`, which this plugin answers from the array — already grown.
+The GUI resize dialog only ever sends an increment, so re-entering it expands
+the volume a **second** time, permanently, since shrinking is refused. And
+qemu-server early-returns when the requested absolute size already matches, so
+no dialog or `qm resize` gesture reaches host propagation at all. The failure
+message therefore says *do not re-run the resize*, and `activate_volume` now
+re-syncs capacity best-effort, which makes starting or migrating the guest the
+supported recovery.
+
+**Only the node running the guest can be stale.** `deactivate_volume` flushes
+this node's map and `activate_volume` rediscovers the LUN at its current size,
+so the other nodes in a cluster hold no device to go stale. An earlier
+assumption that a fleet-wide rescan was needed after every resize was wrong.
+
 ## 4. Performance and per-volume consumption
 
 ### `{storage}/performance`
