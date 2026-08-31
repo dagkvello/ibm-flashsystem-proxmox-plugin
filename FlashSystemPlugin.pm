@@ -60,7 +60,10 @@ use constant REST_PORT => 7443;
 # the volume was still background-formatting at 60%, and an earlier one at
 # 44%. Capacity is published independently of the format.
 #
-# Five minutes is chosen to cover the observed lag with margin. The cost of
+# Two minutes. The earlier 300s was compensating for the wrong mechanism -
+# a rescan-per-iteration loop that never let any rescan finish. With a single
+# rescan the kernel re-reads capacity in seconds, so this is margin, not a
+# working figure. The cost of
 # waiting is a resize task that takes a while and says so; the cost of not
 # waiting is a guest that cannot use capacity the array has already committed,
 # and an operator whose only safe recovery is a manual rescan. Note the attach
@@ -414,6 +417,18 @@ sub _rescan_paths {
     }
 }
 
+sub _paths_min_size {
+    my ($dm) = @_;
+    return undef if !defined $dm || !-d "/sys/block/$dm/slaves";
+    my $min;
+    for my $slave (glob "/sys/block/$dm/slaves/*") {
+        my $b = _dev_size((split m{/}, $slave)[-1]);
+        return undef if !defined $b;
+        $min = $b if !defined $min || $b < $min;
+    }
+    return $min;
+}
+
 sub _path_sizes {
     my ($dm) = @_;
     return 'none' if !defined $dm || !-d "/sys/block/$dm/slaves";
@@ -428,7 +443,13 @@ sub _path_sizes {
 # Where multipath publishes its maps. A variable purely so the tests can point
 # the settle loop at a fixture directory; nothing else should change it.
 our $MAPPER_DIR = '/dev/mapper';
-our $RESIZE_SETTLE_TIMEOUT = 300;
+our $RESIZE_SETTLE_TIMEOUT = 120;
+
+# Seconds between polls, and between the occasional re-nudge of the SCSI
+# rescan. Variables for the same reason as the timeout: so the tests can drive
+# the loop without spending real wall-clock seconds.
+our $RESIZE_POLL_INTERVAL   = 2;
+our $RESIZE_RESCAN_INTERVAL = 30;
 
 # Propagate an array-side resize to THIS node's block device.
 #
@@ -481,26 +502,51 @@ sub _resize_host_device {
     my $deadline = time() + $budget;
     my $started = time();
     my $told = 0;
+
+    # Rescan ONCE, then wait for the kernel to finish re-reading capacity.
+    #
+    # The obvious loop - rescan, resize, check, repeat - does not work, and the
+    # way it fails is worth recording. Measured live 2026-08-31: 300 seconds of
+    # rescanning every second left all 8 paths on the old size, and the same
+    # rescan issued by hand with a 5-second pause picked the new size up at
+    # once. Re-triggering a SCSI rescan while one is still in flight appears to
+    # stop any of them completing, so the loop was thrashing the mechanism it
+    # was waiting on. Nudge occasionally; mostly just wait.
+    _rescan_paths($dm);
+    my $last_rescan = time();
+
     while (1) {
-        # PVE captures stderr into the task log, so a multi-minute settle shows
-        # as progress instead of a task that appears wedged.
+        select(undef, undef, undef, $RESIZE_POLL_INTERVAL);
+
+        # The paths carry the array's capacity; the map can only follow them,
+        # so resizing it before they have caught up achieves nothing.
+        my $pmin = _paths_min_size($dm);
+        if (defined $pmin && $pmin >= $want) {
+            run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
+            # Re-resolve: a map reassembled underneath us can land on a
+            # different dm number, and checking the wrong device is how this
+            # would quietly report success again.
+            $dm = _dm_node($map) // $dm;
+            $size = _dev_size($dm);
+            last if defined $size && $size >= $want;
+        }
+        last if time() >= $deadline;
+
+        if (time() - $last_rescan >= $RESIZE_RESCAN_INTERVAL) {
+            _rescan_paths($dm);
+            $last_rescan = time();
+        }
+        # PVE captures stderr into the task log, so a long settle reads as
+        # work rather than as a wedged task.
         if ($budget > 30 && time() - $started >= $told + 30) {
             $told = time() - $started;
             warn sprintf("flashsystem: waiting for %s to reach %d bytes "
-                . "(currently %s) - %ds of %ds\n",
-                $map, $want, (defined $size ? $size : 'unreadable'), $told, $budget);
+                . "(paths at %s) - %ds of %ds\n",
+                $map, $want, (defined $pmin ? $pmin : 'unreadable'), $told, $budget);
         }
-        _rescan_paths($dm);
-        run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
-        # Re-resolve: a map reassembled underneath us can land on a different
-        # dm number, and checking the size of the wrong device is how this
-        # would quietly report success again.
-        $dm = _dm_node($map) // $dm;
-        $size = _dev_size($dm);
-        last if defined $size && $size >= $want;
-        last if time() >= $deadline;
-        select(undef, undef, undef, 1);
     }
+    $size = _dev_size($dm) if !defined $size;
+
     return 1 if defined $size && $size >= $want;
 
     # NOTE the wording. Do NOT tell the operator to retry the resize: PVE

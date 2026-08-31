@@ -111,11 +111,19 @@ sub settle {
     no warnings 'redefine', 'once';
     local $PVE::Storage::Custom::FlashSystemPlugin::MAPPER_DIR = $tmp;
     local $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT = $a{budget} // 0;
+    # Drive the loop without spending wall-clock seconds; a unit suite that
+    # sleeps for half a minute stops being run.
+    local $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_POLL_INTERVAL   = $a{poll} // 0;
+    local $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_RESCAN_INTERVAL = $a{nudge} // 30;
     local *PVE::Storage::Custom::FlashSystemPlugin::_dm_node = $a{dm_node} // sub { 'dm-test' };
     local *PVE::Storage::Custom::FlashSystemPlugin::_rescan_paths = sub { $rescans++ };
     local *PVE::Storage::Custom::FlashSystemPlugin::_path_sizes = sub { 'sdaa=21474836480' };
-    local *PVE::Storage::Custom::FlashSystemPlugin::run_command = sub { 0 };
+    my $on_resize = $a{on_resize} // sub { };
+    local *PVE::Storage::Custom::FlashSystemPlugin::run_command = sub { $on_resize->(); 0 };
     local *PVE::Storage::Custom::FlashSystemPlugin::_dev_size = sub { @seq ? shift(@seq) : undef };
+    my @pseq = @{ $a{paths} // $a{sizes} };
+    local *PVE::Storage::Custom::FlashSystemPlugin::_paths_min_size =
+        sub { @pseq ? shift(@pseq) : undef };
     my $got = eval {
         PVE::Storage::Custom::FlashSystemPlugin::_resize_host_device(
             $wwid, $a{want}, %{ $a{opt} // {} });
@@ -133,10 +141,24 @@ sub settle {
 
 # Behind, then catches up on a later poll - the live 2026-08-31 shape.
 {
-    my $r = settle(sizes => [ 20 * $GB, 20 * $GB, 50 * $GB ], want => 50 * $GB, budget => 30);
+    my $r = settle(sizes  => [ 20 * $GB, 50 * $GB ],
+                   paths  => [ 20 * $GB, 50 * $GB ],
+                   want => 50 * $GB, budget => 30);
     ok_case('settle: catches up', $r->{ret}, 1);
-    ok_case('settle: polled more than once', ($r->{rescans} >= 2 ? 'yes' : "no:$r->{rescans}"), 'yes');
     ok_case('settle: no error', ($r->{err} ? 'errored' : 'clean'), 'clean');
+    # THE regression that cost two production rollouts: rescanning on every
+    # pass re-triggers a SCSI rescan while one is still in flight, and then
+    # none of them ever complete. 300s of that left the paths untouched; one
+    # rescan and a short wait worked immediately. Rescan once, then wait.
+    ok_case('settle: rescans ONCE, does not thrash', $r->{rescans}, 1);
+}
+
+# Only nudge again after a long quiet spell, never every pass.
+{
+    my $r = settle(sizes => [ (20 * $GB) x 40 ], paths => [ (20 * $GB) x 40 ],
+                   want => 50 * $GB, budget => 3, nudge => 1);
+    ok_case('settle: nudges sparingly, not every pass',
+        ($r->{rescans} >= 2 && $r->{rescans} <= 5 ? 'yes' : "no:$r->{rescans}"), 'yes');
 }
 
 # Never catches up: must DIE, not return success onto a stale device. Returning
@@ -166,20 +188,32 @@ sub settle {
     ok_case('settle: best effort still warns', (grep { /did not catch up/ } @warned) ? 'yes' : 'no', 'yes');
 }
 
+# The map must not be resized while the paths are still behind: the map can
+# only follow the paths, so an early resize is a no-op that muddies the
+# diagnosis.
+{
+    my $resizes = 0;
+    no warnings 'redefine';
+    my $r = settle(sizes => [ 20 * $GB, 50 * $GB ], paths => [ 20 * $GB, 50 * $GB ],
+                   want => 50 * $GB, budget => 30,
+                   on_resize => sub { $resizes++ });
+    ok_case('settle: map resized only once paths are ready', $resizes, 1);
+}
+
 # budget => 0 is what activate_volume passes: exactly one corrective pass, no
 # sleeping. Every VM start and every migration goes through that path, so a
 # device that will not catch up must cost ~nothing rather than 60 seconds.
 {
-    my $r = settle(sizes => [ 20 * $GB, 20 * $GB ], want => 50 * $GB,
-                   opt => { best_effort => 1, budget => 0 });
+    my $r = settle(sizes => [ 20 * $GB, 20 * $GB ], paths => [ 20 * $GB, 20 * $GB ],
+                   want => 50 * $GB, opt => { best_effort => 1, budget => 0 });
     ok_case('attach: one corrective pass', $r->{rescans}, 1);
     ok_case('attach: never dies', ($r->{err} ? 'died' : 'survived'), 'survived');
 }
 
 # ...and when that single pass fixes it, the attach succeeds silently.
 {
-    my $r = settle(sizes => [ 20 * $GB, 50 * $GB ], want => 50 * $GB,
-                   opt => { best_effort => 1, budget => 0 });
+    my $r = settle(sizes => [ 20 * $GB, 50 * $GB ], paths => [ 50 * $GB, 50 * $GB ],
+                   want => 50 * $GB, opt => { best_effort => 1, budget => 0 });
     ok_case('attach: single pass can succeed', $r->{ret}, 1);
     ok_case('attach: succeeded on one rescan', $r->{rescans}, 1);
 }
