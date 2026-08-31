@@ -12,10 +12,24 @@
 
 use strict; use warnings;
 use FindBin;
-use lib "$FindBin::Bin/stub";
+# PVE runs its daemons under `perl -T`, so this suite does too. A plugin that
+# passes here and then dies on the array with "Insecure dependency in open"
+# is exactly what happened on 2026-08-31: every SCSI rescan and every path
+# delete this plugin issued had been failing, unchecked, since the first
+# release - while the same writes from a shell always worked.
+#
+# Taint mode rejects tainted @INC entries and a tainted require path, and
+# FindBin derives both from $0. Untaint them HERE, in the harness, so the
+# module under test still faces taint mode with ITS inputs (readlink, glob)
+# tainted - which is the condition that actually matters.
+# `our`, not `my`: a runtime `my` declaration re-initialises the variable to
+# undef when execution reaches it, discarding what BEGIN put there.
+our $BIN;
+BEGIN { ($BIN) = $FindBin::Bin =~ m{\A(.*)\z}s; }
+use lib "$BIN/stub";
 
-my ($PLUGIN) = grep { -f } ("$FindBin::Bin/../files/FlashSystemPlugin.pm",
-                            "$FindBin::Bin/../FlashSystemPlugin.pm");
+my ($PLUGIN) = grep { -f } ("$BIN/../files/FlashSystemPlugin.pm",
+                            "$BIN/../FlashSystemPlugin.pm");
 require $PLUGIN;
 my $P = 'PVE::Storage::Custom::FlashSystemPlugin';
 
@@ -100,7 +114,13 @@ sub run_resize {
 # nothing - a parameter swap in the sub survived it. $MAPPER_DIR exists so the
 # loop can be driven against a fixture instead.
 use File::Temp qw(tempdir);
+# Untaint the fixture root, because in production $SYSFS_BLOCK is a LITERAL
+# and therefore untainted, while the device names under it come from glob()
+# and are tainted. tempdir() derives from $ENV{TMPDIR}, so leaving it tainted
+# would taint the whole path and the test would pass or fail for a reason
+# production never sees.
 my $tmp = tempdir(CLEANUP => 1);
+($tmp) = $tmp =~ m{\A(.*)\z}s;
 
 sub settle {
     my (%a) = @_;
@@ -310,11 +330,85 @@ ok_case('settle timeout is bounded',
     close $r;
     ok_case('rescan: actually wrote the trigger', $wrote, "1\n");
 
+    # THE 2026-08-31 root cause. PVE runs pvedaemon under `perl -T`; the device
+    # names come from glob() and are tainted; a tainted path is legal in a read
+    # open() and illegal in a write one. So every rescan this plugin ever
+    # issued died with "Insecure dependency in open", in an eval, unchecked,
+    # on all 8 paths - while _dev_size read those same paths without complaint
+    # and the identical write from a shell always worked. The array was blamed
+    # for a host-side bug for a full day. This whole file now runs under -T.
+    ok_case('rescan: survives taint mode (-T)',
+        (${^TAINT} ? ($ok == 1 ? 'wrote under -T' : 'BLOCKED BY TAINT') : 'not tainted'),
+        'wrote under -T');
+
     my ($no_ok, $no_total, $no_err) =
         PVE::Storage::Custom::FlashSystemPlugin::_rescan_paths('dm-absent');
     ok_case('rescan: unknown dm reports zero paths', "$no_ok/$no_total", '0/0');
     ok_case('rescan: unknown dm explains itself',
         (defined $no_err ? 'yes' : 'no'), 'yes');
+}
+
+# ---- _flush_device deletes the SCSI paths, under taint ---------------------
+# The detach path had the identical taint defect as the rescan and no test at
+# all. Its consequence is worse than a failed resize: the comment on the sub
+# explains that leaving stale sd nodes behind makes the array's next reuse of
+# those LUN numbers reassemble the OLD wwid, so the new device never appears.
+# That has been silently true on every detach this plugin has ever performed.
+{
+    my $sys = tempdir(CLEANUP => 1);
+    ($sys) = $sys =~ m{\A(.*)\z}s;
+    # The mapper dir lives INSIDE the fixture so the relative symlink below
+    # resolves, exactly as /dev/mapper/<wwid> -> ../dm-N does on a real host.
+    # _flush_device gates on -e $map, so a dangling link skips the whole body.
+    my $mapdir = "$sys/mapper";
+    make_path($mapdir, "$sys/dm-flush/slaves/sdxx", "$sys/sdxx/device");
+    open(my $d, '>', "$sys/sdxx/device/delete") or die $!; close $d;
+    # readlink() is what taints the dm name in production, so the fixture has
+    # to be a real symlink rather than a plain file.
+    symlink("../dm-flush", "$mapdir/wwidflush") or die "symlink: $!";
+
+    no warnings 'redefine', 'once';
+    local $PVE::Storage::Custom::FlashSystemPlugin::SYSFS_BLOCK = $sys;
+    local $PVE::Storage::Custom::FlashSystemPlugin::MAPPER_DIR  = $mapdir;
+    my @ran;
+    local *PVE::Storage::Custom::FlashSystemPlugin::run_command =
+        sub { push @ran, $_[0]; 0 };
+    my @warned;
+    local $SIG{__WARN__} = sub { push @warned, $_[0] };
+
+    my $got = PVE::Storage::Custom::FlashSystemPlugin::_flush_device('wwidflush');
+    ok_case('flush: returns cleanly', $got, 1);
+    ok_case('flush: flushed the map',
+        ((grep { $_->[0] eq 'multipath' && $_->[1] eq '-f' } @ran) ? 'yes' : 'no'), 'yes');
+
+    open(my $r, '<', "$sys/sdxx/device/delete") or die $!;
+    my $wrote = do { local $/; <$r> };
+    close $r;
+    ok_case('flush: deleted the SCSI path under -T', $wrote, "1\n");
+    ok_case('flush: silent when every path went away',
+        (scalar(@warned) ? "warned: $warned[0]" : 'silent'), 'silent');
+}
+
+# ...and a path it could NOT delete has to be said out loud, not swallowed.
+{
+    my $sys = tempdir(CLEANUP => 1);
+    ($sys) = $sys =~ m{\A(.*)\z}s;
+    my $mapdir = "$sys/mapper";
+    make_path($mapdir, "$sys/dm-stuck/slaves/sdyy");  # no $sys/sdyy/device/delete
+    symlink("../dm-stuck", "$mapdir/wwidstuck") or die "symlink: $!";
+
+    no warnings 'redefine', 'once';
+    local $PVE::Storage::Custom::FlashSystemPlugin::SYSFS_BLOCK = $sys;
+    local $PVE::Storage::Custom::FlashSystemPlugin::MAPPER_DIR  = $mapdir;
+    local *PVE::Storage::Custom::FlashSystemPlugin::run_command = sub { 0 };
+    my @warned;
+    local $SIG{__WARN__} = sub { push @warned, $_[0] };
+
+    PVE::Storage::Custom::FlashSystemPlugin::_flush_device('wwidstuck');
+    ok_case('flush: warns about a path it could not delete',
+        ((grep { /could not be deleted/ } @warned) ? 'yes' : 'no'), 'yes');
+    ok_case('flush: explains why that matters',
+        ((grep { /reassemble the OLD map/ } @warned) ? 'yes' : 'no'), 'yes');
 }
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall resize cases pass\n";

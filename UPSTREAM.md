@@ -227,13 +227,33 @@ came back — which is a race, and it loses. Observed live 2026-08-31: a
 the dm map followed them, `volume_resize` returned success, and QEMU failed
 the guest-side grow with `Cannot grow device files` — an error three layers
 from the cause, on a resize the array had already completed. A manual rescan
-minutes later worked instantly *while the array was still background-
-formatting at 44%*, which rules formatting out. **What gates the delay is
-still unresolved.** On the same host, against the same array, the same rescan
-has completed in 5 seconds and failed to complete in 300. We have not found
-the variable, and three plausible explanations - background formatting,
-array commit latency, and rescan thrashing - were each tested and each
-falsified. Everything below is about failing legibly, not about a cure.
+minutes later worked instantly.
+
+**The cause was Perl taint mode, and it was never the array.** PVE runs
+`pvedaemon` under `perl -T`. Every device name here comes from `readlink()`
+or `glob()` and is therefore tainted, and Perl permits a tainted path in a
+*read* `open()` while refusing it in a *write* one:
+
+```
+Insecure dependency in open while running with -T switch
+```
+
+So every `echo 1 > /sys/block/<sd>/device/rescan` this plugin issued failed -
+inside an `eval`, unchecked, on all 8 paths, every time - while `_dev_size`
+read those same paths without complaint and the identical write by hand from
+a shell always worked, because a login shell is not tainted. The array
+publishes new capacity in about 40 seconds; the host had simply never asked.
+
+It also explains why `qm resize` from a shell succeeded where the GUI resize
+failed: the same API handler, a different process, and only one of them
+tainted.
+
+Anyone porting this sample into a PVE storage plugin should assume taint mode
+and **run their tests under `-T`**. This suite did not, and stayed green for
+the entire life of the bug. Three plausible explanations - background
+formatting, array commit latency, and rescan thrashing - were investigated
+and falsified before the instrumentation that counted whether the writes were
+accepted at all settled it in one failure.
 
 `_resize_host_device` now checks first, and only if the device is behind does
 it rescan, resize the map and re-check, until the requested size is reached or
@@ -268,8 +288,15 @@ rescans: 4 pass(es), 8 of 8 paths accepted the write
 ```
 
 `8 of 8` means the writes landed and the array is genuinely not publishing;
-`0 of 8` with an error means the host never asked. Worth building in from the
-start rather than after the fact.
+`0 of 8` with an error means the host never asked - which is what it turned
+out to be. Worth building in from the start rather than after the fact.
+
+`_flush_device` carried the identical defect on `.../device/delete`, so the
+detach path had never removed stale SCSI path devices either. That is the
+condition its own comment warns about: the array's next reuse of those LUN
+numbers reassembles the OLD wwid and the new volume never appears. Both write
+sites now pass the device name through a validating untaint - no `/`, so the
+name cannot escape `$SYSFS_BLOCK`, and `.`/`..` refused.
 
 **Only the node running the guest can be stale.** `deactivate_volume` flushes
 this node's map and `activate_volume` rediscovers the LUN at its current size,

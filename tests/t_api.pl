@@ -9,15 +9,29 @@
 
 use strict; use warnings;
 use FindBin;
-use lib "$FindBin::Bin/stub";
+# PVE runs its daemons under `perl -T`, so this suite does too. A plugin that
+# passes here and then dies on the array with "Insecure dependency in open"
+# is exactly what happened on 2026-08-31: every SCSI rescan and every path
+# delete this plugin issued had been failing, unchecked, since the first
+# release - while the same writes from a shell always worked.
+#
+# Taint mode rejects tainted @INC entries and a tainted require path, and
+# FindBin derives both from $0. Untaint them HERE, in the harness, so the
+# module under test still faces taint mode with ITS inputs (readlink, glob)
+# tainted - which is the condition that actually matters.
+# `our`, not `my`: a runtime `my` declaration re-initialises the variable to
+# undef when execution reaches it, discarding what BEGIN put there.
+our $BIN;
+BEGIN { ($BIN) = $FindBin::Bin =~ m{\A(.*)\z}s; }
+use lib "$BIN/stub";
 
 # The plugin must load first (the API module reuses its helpers).
 # Dual-home: ../files/ in a vendored layout, ../ in the standalone repo.
-my ($PLUGIN) = grep { -f } ("$FindBin::Bin/../files/FlashSystemPlugin.pm",
-                            "$FindBin::Bin/../FlashSystemPlugin.pm");
+my ($PLUGIN) = grep { -f } ("$BIN/../files/FlashSystemPlugin.pm",
+                            "$BIN/../FlashSystemPlugin.pm");
 require $PLUGIN;
-my ($API) = grep { -f } ("$FindBin::Bin/../files/FlashSystemAPI.pm",
-                         "$FindBin::Bin/../api/FlashSystemAPI.pm");
+my ($API) = grep { -f } ("$BIN/../files/FlashSystemAPI.pm",
+                         "$BIN/../api/FlashSystemAPI.pm");
 require $API;
 
 my $M = 'PVE::API2::FlashSystem';

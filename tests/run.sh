@@ -9,12 +9,17 @@ MOD=../files/FlashSystemPlugin.pm
 [ -f "$MOD" ] || MOD=../FlashSystemPlugin.pm
 GUI=../files/flashsystem-gui.js
 [ -f "$GUI" ] || GUI=../gui/flashsystem-gui.js
-perl -I stub -c "$MOD"
-perl t_prefix.pl
-perl t_status.pl
-perl t_names.pl
-perl t_resize.pl
-perl t_api.pl
+# -T on every one of these, because PVE runs pvedaemon/pveproxy/pvestatd
+# under taint mode and this suite did not. A tainted path is legal in a read
+# open() and illegal in a write one, so the plugin's SCSI rescans and path
+# deletes had been failing on every node since the first release while the
+# whole suite stayed green. Never run these without -T.
+perl -T -I stub -c "$MOD"
+perl -T t_prefix.pl
+perl -T t_status.pl
+perl -T t_names.pl
+perl -T t_resize.pl
+perl -T t_api.pl
 
 # The GUI render helpers, executed against fixtures with a stubbed ExtJS.
 # Two of the six defects found in review were renderer-only - data the API

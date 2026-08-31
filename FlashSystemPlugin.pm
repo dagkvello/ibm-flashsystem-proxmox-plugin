@@ -319,6 +319,37 @@ sub _rescan_scsi {
     }
 }
 
+# Where the kernel publishes block devices, and where multipath publishes its
+# maps. Variables purely so the tests can drive the device helpers against a
+# fixture; nothing else should set them.
+our $SYSFS_BLOCK = '/sys/block';
+our $MAPPER_DIR  = '/dev/mapper';
+
+# Untaint a sysfs device name, or return undef if it is not one.
+#
+# PVE runs its daemons under `perl -T`, and EVERY device name in this file
+# arrives from readlink() or glob(), so every one of them is tainted. Perl
+# permits tainted paths in a read open() but refuses them in a write open():
+#
+#   Insecure dependency in open while running with -T switch
+#
+# That asymmetry is why this hid for so long. _dev_size read sizes perfectly
+# while every `echo 1 > .../rescan` and every `echo 1 > .../delete` this
+# plugin ever issued failed - in an eval, unchecked, on all 8 paths, every
+# time. From a shell the same writes always worked, so the array took the
+# blame for a host-side bug. Measured live 2026-08-31 once the rescan counted
+# its writes: "0 of 8 paths accepted the write".
+#
+# A regex capture is Perl's untaint operator, so this pattern does real work
+# rather than laundering: no '/' means the name cannot escape $SYSFS_BLOCK,
+# and '.' and '..' are refused outright.
+sub _untaint_dev_name {
+    my ($name) = @_;
+    return undef if !defined $name || !length $name;
+    return undef if $name eq '.' || $name eq '..';
+    return $name =~ /\A([A-Za-z0-9][A-Za-z0-9._-]*)\z/a ? $1 : undef;
+}
+
 # Fully release a LUN from THIS node: flush the multipath map AND delete each
 # underlying SCSI path device. Deleting the sd* devices is essential — if only
 # the map is flushed, the stale path devices linger on the host, and when the
@@ -328,28 +359,48 @@ sub _rescan_scsi {
 sub _flush_device {
     my ($wwid) = @_;
     return 1 if !defined $wwid || !length $wwid;
-    my $map = "/dev/mapper/$wwid";
+    my $map = "$MAPPER_DIR/$wwid";
 
     my @sd;
     if (-e $map) {
         my $target = readlink($map);                   # e.g. "../dm-21"
         my $dm = defined $target ? (split m{/}, $target)[-1] : undef;
-        if (defined $dm && -d "/sys/block/$dm/slaves") {
-            @sd = map { (split m{/}, $_)[-1] } glob "/sys/block/$dm/slaves/*";
+        if (defined $dm && -d "$SYSFS_BLOCK/$dm/slaves") {
+            @sd = map { (split m{/}, $_)[-1] } glob "$SYSFS_BLOCK/$dm/slaves/*";
         }
     }
 
     run_command([ 'multipath', '-f', $wwid ], noerr => 1);
 
+    # Deleting these is not best-effort housekeeping - the comment above is the
+    # bug. A silent failure here leaves stale sd nodes that capture the LUN
+    # number when the array reuses it, so say so instead of discarding it.
+    my ($gone, $stuck, $why) = (0, 0, undef);
     for my $sd (@sd) {
-        my $del = "/sys/block/$sd/device/delete";
-        next if !-w $del;
-        eval {
-            open(my $fh, '>', $del) or die "open $del: $!\n";
-            print {$fh} "1\n";
-            close $fh;
+        my $name = _untaint_dev_name($sd);
+        if (!defined $name) {
+            $stuck++;
+            $why //= "$sd: not a usable device name";
+            next;
+        }
+        my $del = "$SYSFS_BLOCK/$name/device/delete";
+        my $done = eval {
+            open(my $fh, '>', $del) or die "open: $!\n";
+            print {$fh} "1\n" or die "write: $!\n";
+            close $fh or die "close: $!\n";
+            1;
         };
+        if ($done) {
+            $gone++;
+        } else {
+            $stuck++;
+            if (!defined $why) { $why = $@; chomp $why; $why = "$sd: $why"; }
+        }
     }
+    warn sprintf("flashsystem: flushed the map for %s but %d of %d SCSI paths "
+        . "could not be deleted (%s). Stale path devices make the array's next "
+        . "reuse of these LUN numbers reassemble the OLD map.\n",
+        $wwid, $stuck, $gone + $stuck, $why) if $stuck;
     return 1;
 }
 
@@ -358,10 +409,6 @@ sub _flush_device {
 # the new capacity. Re-read each path's capacity, then grow the map. Runs on
 # THIS node only (where the resize is driven); other nodes pick up the new size
 # on their next activate_volume rescan.
-# Where the kernel publishes block devices. A variable purely so the tests can
-# drive the rescan/size helpers against a fixture; nothing else should set it.
-our $SYSFS_BLOCK = '/sys/block';
-
 # Size of a block device from sysfs, in bytes. /sys/block/<dev>/size is in
 # 512-byte sectors regardless of the device's logical block size.
 sub _dev_size {
@@ -388,7 +435,9 @@ sub _dm_node {
     my $target = readlink($map);
     if (defined $target) {
         my $dm = (split m{/}, $target)[-1];
-        return $dm if defined $dm && $dm =~ /\Adm-\d+\z/a;
+        # Return the CAPTURE, not $dm: readlink() output is tainted, and an
+        # untainted dm name is what makes the write opens below legal.
+        return $1 if defined $dm && $dm =~ /\A(dm-\d+)\z/a;
     }
     # Fall back to the kernel's own name map. Deliberately not stat/rdev
     # arithmetic: dev_t bit-packing is easy to get subtly wrong in Perl.
@@ -400,7 +449,7 @@ sub _dm_node {
         next if !defined $name;
         chomp $name;
         next if $name ne $want;
-        return (split m{/}, $f)[-3];    # /sys/block/<dm-N>/dm/name
+        return _untaint_dev_name((split m{/}, $f)[-3]);    # <dm-N> from the path
     }
     return undef;
 }
@@ -420,9 +469,13 @@ sub _rescan_paths {
     return (0, 0, 'no dm slaves') if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
     my ($ok, $total, $err) = (0, 0, undef);
     for my $slave (glob "$SYSFS_BLOCK/$dm/slaves/*") {
-        my $sd = (split m{/}, $slave)[-1];
-        my $rescan = "$SYSFS_BLOCK/$sd/device/rescan";
+        my $sd = _untaint_dev_name((split m{/}, $slave)[-1]);
         $total++;
+        if (!defined $sd) {
+            $err //= ((split m{/}, $slave)[-1] // '?') . ': not a usable device name';
+            next;
+        }
+        my $rescan = "$SYSFS_BLOCK/$sd/device/rescan";
         my $done = eval {
             open(my $fh, '>', $rescan) or die "open: $!\n";
             print {$fh} "1\n" or die "write: $!\n";
@@ -463,9 +516,6 @@ sub _path_sizes {
     return @p ? join(' ', @p) : 'none';
 }
 
-# Where multipath publishes its maps. A variable purely so the tests can point
-# the settle loop at a fixture directory; nothing else should change it.
-our $MAPPER_DIR = '/dev/mapper';
 our $RESIZE_SETTLE_TIMEOUT = 120;
 
 # Seconds between polls, and between the occasional re-nudge of the SCSI

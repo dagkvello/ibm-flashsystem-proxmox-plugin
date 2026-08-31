@@ -47,11 +47,25 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 - The failure message and the runbook now name `qm rescan --vmid <id>` for
   the config half of a failed resize: it reads `volume_size_info` and writes
   the VM config, so unlike the GUI dialog it cannot grow the array.
-- **The cause of the slow propagation is still open.** Three explanations
-  were tested and falsified (background formatting, array commit latency,
-  rescan thrashing). The same rescan on the same host has taken 5 seconds
-  and has failed to complete in 300. These changes make the failure legible;
-  they do not fix it.
+- **Root cause: Perl taint mode.** PVE runs `pvedaemon` under `perl -T`.
+  Device names come from `readlink()`/`glob()` and are tainted, and Perl
+  allows a tainted path in a read `open()` but refuses it in a write one -
+  so every SCSI rescan this plugin ever issued died with `Insecure
+  dependency in open`, in an `eval`, unchecked, on all 8 paths. `_dev_size`
+  read the same paths fine and a shell `echo 1 > .../rescan` always worked,
+  so the array was blamed for a host-side bug. Found by the rescan
+  accounting above, on its first failure. It also explains why `qm resize`
+  succeeded where the GUI failed: same handler, different process, only one
+  tainted. The array commits in ~40s.
+- **`_flush_device` had the same defect** writing `.../device/delete`, so
+  detach never removed stale SCSI path devices - the exact condition that
+  makes the array's next reuse of a LUN number reassemble the old map. It
+  also discarded the result; it now untaints, counts and warns, and has
+  tests where it previously had none.
+- **The test suite runs under `-T`.** This is the structural fix: the suite
+  stayed green for the whole life of the bug because it ran untainted while
+  production did not. Reinstating either untaint now fails 4 cases for the
+  rescan and 2 for the flush.
 
 ## Unreleased — 2026-08-26
 
