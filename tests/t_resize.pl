@@ -166,6 +166,24 @@ sub settle {
     ok_case('settle: best effort still warns', (grep { /did not catch up/ } @warned) ? 'yes' : 'no', 'yes');
 }
 
+# budget => 0 is what activate_volume passes: exactly one corrective pass, no
+# sleeping. Every VM start and every migration goes through that path, so a
+# device that will not catch up must cost ~nothing rather than 60 seconds.
+{
+    my $r = settle(sizes => [ 20 * $GB, 20 * $GB ], want => 50 * $GB,
+                   opt => { best_effort => 1, budget => 0 });
+    ok_case('attach: one corrective pass', $r->{rescans}, 1);
+    ok_case('attach: never dies', ($r->{err} ? 'died' : 'survived'), 'survived');
+}
+
+# ...and when that single pass fixes it, the attach succeeds silently.
+{
+    my $r = settle(sizes => [ 20 * $GB, 50 * $GB ], want => 50 * $GB,
+                   opt => { best_effort => 1, budget => 0 });
+    ok_case('attach: single pass can succeed', $r->{ret}, 1);
+    ok_case('attach: succeeded on one rescan', $r->{rescans}, 1);
+}
+
 # An unnameable dm device is reported at once. Spending the whole budget to say
 # "unreadable" would point the operator at the FC paths, which are fine.
 {

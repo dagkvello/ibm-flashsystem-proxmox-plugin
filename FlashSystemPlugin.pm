@@ -430,8 +430,12 @@ our $RESIZE_SETTLE_TIMEOUT = 60;
 # catches up or the budget runs out. The previous version swallowed every
 # error and returned success regardless.
 #
-# best_effort => 1 warns instead of dying. activate_volume uses it: a device
-# that will not catch up must not stop a VM from starting.
+# best_effort => 1 warns instead of dying, and budget => N overrides the settle
+# time. activate_volume passes both: a device that will not catch up must not
+# stop a VM from starting, and must not delay one either. With budget => 0 it
+# makes exactly ONE corrective pass and never sleeps - the attach path is on
+# every VM start and every migration, so it has to stay cheap even when
+# something is off.
 sub _resize_host_device {
     my ($wwid, $want, %opt) = @_;
     my $map = "$MAPPER_DIR/$wwid";
@@ -457,7 +461,8 @@ sub _resize_host_device {
     my $size = _dev_size($dm);
     return 1 if !defined $want || (defined $size && $size >= $want);
 
-    my $deadline = time() + $RESIZE_SETTLE_TIMEOUT;
+    my $budget = defined $opt{budget} ? $opt{budget} : $RESIZE_SETTLE_TIMEOUT;
+    my $deadline = time() + $budget;
     while (1) {
         _rescan_paths($dm);
         run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
@@ -491,7 +496,7 @@ sub _resize_host_device {
         . "'multipathd resize map %s'. Stopping and starting the guest, or "
         . "migrating it, also re-syncs the device.\n",
         $want, (defined $size ? "$size bytes" : 'unreadable'),
-        $RESIZE_SETTLE_TIMEOUT, $map, _path_sizes($dm), $wwid), $opt{best_effort});
+        $budget, $map, _path_sizes($dm), $wwid), $opt{best_effort});
 }
 
 sub _resize_failed {
@@ -762,7 +767,7 @@ sub activate_volume {
     #
     # Best effort on purpose: a capacity mismatch must never stop a VM from
     # starting, and the fast path here is a single sysfs read.
-    eval { _resize_host_device($wwid, $vdisk->{capacity} + 0, best_effort => 1) };
+    eval { _resize_host_device($wwid, $vdisk->{capacity} + 0, best_effort => 1, budget => 0) };
     return 1;
 }
 
