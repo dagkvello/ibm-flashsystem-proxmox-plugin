@@ -46,12 +46,28 @@ use base qw(PVE::Storage::Plugin);
 use constant REST_PORT => 7443;
 
 # How long to wait for a host block device to catch up with an array-side
-# resize. The array commits the new capacity a moment after expandvdisksize
-# returns; a single rescan can easily beat it. Generous because the cost of
-# waiting is a slow resize task, and the cost of not waiting is a guest that
-# cannot use capacity the array has already charged for. A variable rather
-# than a constant so the tests can exercise the give-up path in under a
-# second; nothing in production should change it.
+# resize.
+#
+# Measured, not guessed. On a FlashSystem 5200 (8.7.0.3) a +1G expand was
+# still not visible to READ CAPACITY after SIXTY seconds of continuous
+# rescanning - all 8 paths held the old size - and the identical rescan issued
+# by hand a few minutes later picked it up at once. So the array's commit can
+# lag well past a minute, and the first cut of this timeout (60s) turned a
+# slow success into a hard failure.
+#
+# Formatting is NOT the mechanism, which is worth writing down because it is
+# the obvious suspect and it is wrong: the successful rescan happened while
+# the volume was still background-formatting at 60%, and an earlier one at
+# 44%. Capacity is published independently of the format.
+#
+# Five minutes is chosen to cover the observed lag with margin. The cost of
+# waiting is a resize task that takes a while and says so; the cost of not
+# waiting is a guest that cannot use capacity the array has already committed,
+# and an operator whose only safe recovery is a manual rescan. Note the attach
+# path passes budget => 0 and never waits at all.
+#
+# A variable rather than a constant so the tests can exercise the give-up path
+# in under a second; nothing in production should change it.
 
 # ---- Plugin identity / schema -------------------------------------------
 
@@ -412,7 +428,7 @@ sub _path_sizes {
 # Where multipath publishes its maps. A variable purely so the tests can point
 # the settle loop at a fixture directory; nothing else should change it.
 our $MAPPER_DIR = '/dev/mapper';
-our $RESIZE_SETTLE_TIMEOUT = 60;
+our $RESIZE_SETTLE_TIMEOUT = 300;
 
 # Propagate an array-side resize to THIS node's block device.
 #
@@ -463,7 +479,17 @@ sub _resize_host_device {
 
     my $budget = defined $opt{budget} ? $opt{budget} : $RESIZE_SETTLE_TIMEOUT;
     my $deadline = time() + $budget;
+    my $started = time();
+    my $told = 0;
     while (1) {
+        # PVE captures stderr into the task log, so a multi-minute settle shows
+        # as progress instead of a task that appears wedged.
+        if ($budget > 30 && time() - $started >= $told + 30) {
+            $told = time() - $started;
+            warn sprintf("flashsystem: waiting for %s to reach %d bytes "
+                . "(currently %s) - %ds of %ds\n",
+                $map, $want, (defined $size ? $size : 'unreadable'), $told, $budget);
+        }
         _rescan_paths($dm);
         run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
         # Re-resolve: a map reassembled underneath us can land on a different

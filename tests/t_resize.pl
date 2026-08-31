@@ -207,9 +207,11 @@ sub settle {
 }
 
 # ---- the settle budget is a real, finite number ----------------------------
+# Bounded, and long enough for the commit lag measured live: a +1G expand was
+# still invisible to READ CAPACITY after 60s of continuous rescanning.
 ok_case('settle timeout is bounded',
-    ($PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT > 0
-     && $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT <= 300) ? 'yes' : 'no', 'yes');
+    ($PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT >= 120
+     && $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT <= 900) ? 'yes' : 'no', 'yes');
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall resize cases pass\n";
 exit($fail ? 1 : 0);
