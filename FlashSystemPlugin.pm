@@ -358,12 +358,16 @@ sub _flush_device {
 # the new capacity. Re-read each path's capacity, then grow the map. Runs on
 # THIS node only (where the resize is driven); other nodes pick up the new size
 # on their next activate_volume rescan.
+# Where the kernel publishes block devices. A variable purely so the tests can
+# drive the rescan/size helpers against a fixture; nothing else should set it.
+our $SYSFS_BLOCK = '/sys/block';
+
 # Size of a block device from sysfs, in bytes. /sys/block/<dev>/size is in
 # 512-byte sectors regardless of the device's logical block size.
 sub _dev_size {
     my ($dev) = @_;
     return undef if !defined $dev || !length $dev;
-    open(my $fh, '<', "/sys/block/$dev/size") or return undef;
+    open(my $fh, '<', "$SYSFS_BLOCK/$dev/size") or return undef;
     my $sectors = <$fh>;
     close $fh;
     return undef if !defined $sectors;
@@ -389,7 +393,7 @@ sub _dm_node {
     # Fall back to the kernel's own name map. Deliberately not stat/rdev
     # arithmetic: dev_t bit-packing is easy to get subtly wrong in Perl.
     my $want = (split m{/}, $map)[-1];
-    for my $f (glob "/sys/block/dm-*/dm/name") {
+    for my $f (glob "$SYSFS_BLOCK/dm-*/dm/name") {
         open(my $fh, '<', $f) or next;
         my $name = <$fh>;
         close $fh;
@@ -402,26 +406,45 @@ sub _dm_node {
 }
 
 # Ask every SCSI path under a dm node to re-read its capacity.
+#
+# Returns (accepted, total, first_error). The old version skipped unwritable
+# paths silently and threw away close() errors, which made "the rescan never
+# happened" indistinguishable in the task log from "the array is slow to
+# publish the new capacity". Those two need opposite responses, and telling
+# them apart is the entire difficulty of this failure mode - so count the
+# writes that actually landed and report the first one that did not. sysfs
+# surfaces write errors at close() as readily as at print(), so both are
+# checked.
 sub _rescan_paths {
     my ($dm) = @_;
-    return if !defined $dm || !-d "/sys/block/$dm/slaves";
-    for my $slave (glob "/sys/block/$dm/slaves/*") {
+    return (0, 0, 'no dm slaves') if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
+    my ($ok, $total, $err) = (0, 0, undef);
+    for my $slave (glob "$SYSFS_BLOCK/$dm/slaves/*") {
         my $sd = (split m{/}, $slave)[-1];
-        my $rescan = "/sys/block/$sd/device/rescan";
-        next if !-w $rescan;
-        eval {
-            open(my $fh, '>', $rescan) or die "open $rescan: $!\n";
-            print {$fh} "1\n";
-            close $fh;
+        my $rescan = "$SYSFS_BLOCK/$sd/device/rescan";
+        $total++;
+        my $done = eval {
+            open(my $fh, '>', $rescan) or die "open: $!\n";
+            print {$fh} "1\n" or die "write: $!\n";
+            close $fh or die "close: $!\n";
+            1;
         };
+        if ($done) {
+            $ok++;
+        } elsif (!defined $err) {
+            $err = $@;
+            chomp $err;
+            $err = "$sd: $err";
+        }
     }
+    return ($ok, $total, $err);
 }
 
 sub _paths_min_size {
     my ($dm) = @_;
-    return undef if !defined $dm || !-d "/sys/block/$dm/slaves";
+    return undef if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
     my $min;
-    for my $slave (glob "/sys/block/$dm/slaves/*") {
+    for my $slave (glob "$SYSFS_BLOCK/$dm/slaves/*") {
         my $b = _dev_size((split m{/}, $slave)[-1]);
         return undef if !defined $b;
         $min = $b if !defined $min || $b < $min;
@@ -431,12 +454,12 @@ sub _paths_min_size {
 
 sub _path_sizes {
     my ($dm) = @_;
-    return 'none' if !defined $dm || !-d "/sys/block/$dm/slaves";
+    return 'none' if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
     my @p = map {
         my $sd = (split m{/}, $_)[-1];
         my $b = _dev_size($sd);
         "$sd=" . (defined $b ? $b : '?');
-    } glob "/sys/block/$dm/slaves/*";
+    } glob "$SYSFS_BLOCK/$dm/slaves/*";
     return @p ? join(' ', @p) : 'none';
 }
 
@@ -512,8 +535,10 @@ sub _resize_host_device {
     # once. Re-triggering a SCSI rescan while one is still in flight appears to
     # stop any of them completing, so the loop was thrashing the mechanism it
     # was waiting on. Nudge occasionally; mostly just wait.
-    _rescan_paths($dm);
+    my ($rok, $rtotal, $rerr) = _rescan_paths($dm);
+    my $passes = 1;
     my $last_rescan = time();
+    my $settled = 0;
 
     while (1) {
         select(undef, undef, undef, $RESIZE_POLL_INTERVAL);
@@ -528,12 +553,18 @@ sub _resize_host_device {
             # would quietly report success again.
             $dm = _dm_node($map) // $dm;
             $size = _dev_size($dm);
-            last if defined $size && $size >= $want;
+            if (defined $size && $size >= $want) {
+                $settled = 1;
+                last;
+            }
         }
         last if time() >= $deadline;
 
         if (time() - $last_rescan >= $RESIZE_RESCAN_INTERVAL) {
-            _rescan_paths($dm);
+            my ($o, $t, $e) = _rescan_paths($dm);
+            ($rok, $rtotal) = ($o, $t);
+            $rerr = $e if defined $e;
+            $passes++;
             $last_rescan = time();
         }
         # PVE captures stderr into the task log, so a long settle reads as
@@ -545,8 +576,15 @@ sub _resize_host_device {
                 $map, $want, (defined $pmin ? $pmin : 'unreadable'), $told, $budget);
         }
     }
-    $size = _dev_size($dm) if !defined $size;
+    return 1 if $settled;
 
+    # Nothing above confirmed the device, so $size is still the value read
+    # BEFORE the loop ran - the old `if !defined $size` guard made this a
+    # no-op, because $size was always already defined. Re-read it. multipathd
+    # resizes maps on its own once it notices the paths grew, so the device
+    # can be correct here without any poll having seen it, and reporting the
+    # pre-loop snapshot fails those resizes for no reason.
+    $size = _dev_size($dm);
     return 1 if defined $size && $size >= $want;
 
     # NOTE the wording. Do NOT tell the operator to retry the resize: PVE
@@ -557,18 +595,28 @@ sub _resize_host_device {
     # qemu-server early-returns when the absolute requested size already
     # matches, so there is no dialog gesture that re-runs only this half.
     # Starting or migrating the guest does, via activate_volume.
+    # Report whether the rescans were even accepted. Without this the log
+    # shows only "the paths did not move", which reads as an array problem
+    # whether the cause was the array or a write this node never made.
+    my $rsum = sprintf("%s pass(es), %s of %s paths accepted the write%s",
+        $passes, (defined $rok ? $rok : '?'), (defined $rtotal ? $rtotal : '?'),
+        (defined $rerr ? "; first error: $rerr" : ''));
+
     return _resize_failed(sprintf(
         "flashsystem: the array holds this volume at %d bytes but this node's "
         . "device is %s and did not catch up within %ds.\n"
-        . "  device: %s\n  paths:  %s\n"
+        . "  device: %s\n  paths:  %s\n  rescans: %s\n"
         . "DO NOT re-run the resize - PVE sizes from the array, so the GUI "
         . "increment would grow it again and that cannot be undone.\n"
         . "Recover by rescanning this node: for each path above "
         . "'echo 1 > /sys/block/<sd>/device/rescan', then "
         . "'multipathd resize map %s'. Stopping and starting the guest, or "
-        . "migrating it, also re-syncs the device.\n",
+        . "migrating it, also re-syncs the device. Once the device is right, "
+        . "'qm rescan --vmid <id>' realigns the VM config, which is the half "
+        . "a failed resize leaves behind - it reads the array and writes the "
+        . "config, so it never grows anything.\n",
         $want, (defined $size ? "$size bytes" : 'unreadable'),
-        $budget, $map, _path_sizes($dm), $wwid), $opt{best_effort});
+        $budget, $map, _path_sizes($dm), $rsum, $wwid), $opt{best_effort});
 }
 
 sub _resize_failed {

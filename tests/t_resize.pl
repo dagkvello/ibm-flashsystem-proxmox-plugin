@@ -116,7 +116,10 @@ sub settle {
     local $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_POLL_INTERVAL   = $a{poll} // 0;
     local $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_RESCAN_INTERVAL = $a{nudge} // 30;
     local *PVE::Storage::Custom::FlashSystemPlugin::_dm_node = $a{dm_node} // sub { 'dm-test' };
-    local *PVE::Storage::Custom::FlashSystemPlugin::_rescan_paths = sub { $rescans++ };
+    # Mirrors the real contract: (accepted, total, first_error).
+    my $rescan_cb = $a{rescan} // sub { return (8, 8, undef) };
+    local *PVE::Storage::Custom::FlashSystemPlugin::_rescan_paths =
+        sub { $rescans++; return $rescan_cb->(@_) };
     local *PVE::Storage::Custom::FlashSystemPlugin::_path_sizes = sub { 'sdaa=21474836480' };
     my $on_resize = $a{on_resize} // sub { };
     local *PVE::Storage::Custom::FlashSystemPlugin::run_command = sub { $on_resize->(); 0 };
@@ -175,6 +178,37 @@ sub settle {
         ($r->{err} =~ /DO NOT re-run the resize/a ? 'yes' : 'no'), 'yes');
     ok_case('settle: gives the manual rescan',
         ($r->{err} =~ /multipathd resize map/a ? 'yes' : 'no'), 'yes');
+    # The config half is what a failed resize actually leaves behind, and
+    # qm rescan is the only repair for it that cannot grow the array.
+    ok_case('settle: points at qm rescan for the config',
+        ($r->{err} =~ /qm rescan/a ? 'yes' : 'no'), 'yes');
+    ok_case('settle: accounts for the rescans it issued',
+        ($r->{err} =~ /rescans: \d+ pass/a ? 'yes' : 'no'), 'yes');
+}
+
+# A rescan this node never managed to ISSUE must not read, in the task log,
+# like an array that is slow to publish. Live on 2026-08-31 those two were
+# indistinguishable, and the whole day went into telling them apart.
+{
+    my $r = settle(sizes => [ (20 * $GB) x 6 ], want => 50 * $GB,
+                   rescan => sub { return (0, 8, 'sdaa: open: Permission denied') });
+    ok_case('settle: surfaces a rescan that did not land',
+        ($r->{err} =~ /0 of 8 paths accepted/a ? 'yes' : 'no'), 'yes');
+    ok_case('settle: names the rescan error',
+        ($r->{err} =~ /Permission denied/a ? 'yes' : 'no'), 'yes');
+}
+
+# The device can be correct without any poll having seen it: multipathd
+# resizes maps on its own once it notices the paths grew. The final verdict
+# therefore has to re-read the device, not trust the snapshot taken before the
+# loop - which is exactly what `$size = _dev_size($dm) if !defined $size` did,
+# a no-op, because $size was always already defined.
+{
+    my $r = settle(sizes => [ 20 * $GB, 50 * $GB ], paths => [ undef ],
+                   want => 50 * $GB, opt => { budget => 0 });
+    ok_case('settle: final verdict re-reads the device', $r->{ret}, 1);
+    ok_case('settle: and does not die on a device that is fine',
+        ($r->{err} ? 'died' : 'clean'), 'clean');
 }
 
 # best_effort warns instead of dying - activate_volume must never block a VM
@@ -246,6 +280,42 @@ sub settle {
 ok_case('settle timeout is bounded',
     ($PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT >= 120
      && $PVE::Storage::Custom::FlashSystemPlugin::RESIZE_SETTLE_TIMEOUT <= 900) ? 'yes' : 'no', 'yes');
+
+# ---- _rescan_paths itself, against a fixture /sys/block --------------------
+# Everything above stubs this out, so until now the sub that does the actual
+# work was the one part of the resize path with no test at all.
+{
+    use File::Path qw(make_path);
+    my $sys = tempdir(CLEANUP => 1);
+    make_path("$sys/dm-test/slaves/sdaa", "$sys/dm-test/slaves/sdbb",
+              "$sys/sdaa/device");
+    # sdaa can be rescanned; sdbb has no device/rescan at all, which is what a
+    # path that has gone away underneath the map looks like.
+    open(my $w, '>', "$sys/sdaa/device/rescan") or die $!; close $w;
+
+    no warnings 'once';
+    local $PVE::Storage::Custom::FlashSystemPlugin::SYSFS_BLOCK = $sys;
+    my ($ok, $total, $err) =
+        PVE::Storage::Custom::FlashSystemPlugin::_rescan_paths('dm-test');
+    ok_case('rescan: counts the writes that landed', $ok, 1);
+    ok_case('rescan: counts every path', $total, 2);
+    ok_case('rescan: names the path that failed',
+        (defined $err && $err =~ /\Asdbb:/a ? 'yes' : 'no:' . ($err // 'undef')), 'yes');
+
+    # Opening the file is not the same as writing to it. The old version could
+    # not tell the difference, and a silently-dropped write is the one failure
+    # that looks exactly like a slow array.
+    open(my $r, '<', "$sys/sdaa/device/rescan") or die $!;
+    my $wrote = do { local $/; <$r> };
+    close $r;
+    ok_case('rescan: actually wrote the trigger', $wrote, "1\n");
+
+    my ($no_ok, $no_total, $no_err) =
+        PVE::Storage::Custom::FlashSystemPlugin::_rescan_paths('dm-absent');
+    ok_case('rescan: unknown dm reports zero paths', "$no_ok/$no_total", '0/0');
+    ok_case('rescan: unknown dm explains itself',
+        (defined $no_err ? 'yes' : 'no'), 'yes');
+}
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall resize cases pass\n";
 exit($fail ? 1 : 0);

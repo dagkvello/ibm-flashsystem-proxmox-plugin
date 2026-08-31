@@ -228,7 +228,12 @@ the dm map followed them, `volume_resize` returned success, and QEMU failed
 the guest-side grow with `Cannot grow device files` — an error three layers
 from the cause, on a resize the array had already completed. A manual rescan
 minutes later worked instantly *while the array was still background-
-formatting at 44%*, which rules formatting out and leaves plain timing.
+formatting at 44%*, which rules formatting out. **What gates the delay is
+still unresolved.** On the same host, against the same array, the same rescan
+has completed in 5 seconds and failed to complete in 300. We have not found
+the variable, and three plausible explanations - background formatting,
+array commit latency, and rescan thrashing - were each tested and each
+falsified. Everything below is about failing legibly, not about a cure.
 
 `_resize_host_device` now checks first, and only if the device is behind does
 it rescan, resize the map and re-check, until the requested size is reached or
@@ -245,7 +250,26 @@ qemu-server early-returns when the requested absolute size already matches, so
 no dialog or `qm resize` gesture reaches host propagation at all. The failure
 message therefore says *do not re-run the resize*, and `activate_volume` now
 re-syncs capacity best-effort, which makes starting or migrating the guest the
-supported recovery.
+supported recovery. For the config half - the array grown, the VM config left
+behind - `qm rescan --vmid <id>` is the repair: it reads `volume_size_info`
+and writes the config, so unlike the GUI dialog it cannot ask the array to
+grow anything.
+
+**A rescan that never landed looks exactly like a slow array.** Both produce
+the same observable - the paths did not move - and they need opposite
+responses. The first version skipped unwritable paths silently and discarded
+`close()` errors, so the task log could not tell them apart, and a day of
+diagnosis went into a question the instrumentation should have answered.
+`_rescan_paths` returns `(accepted, total, first_error)` and the failure
+message carries them:
+
+```
+rescans: 4 pass(es), 8 of 8 paths accepted the write
+```
+
+`8 of 8` means the writes landed and the array is genuinely not publishing;
+`0 of 8` with an error means the host never asked. Worth building in from the
+start rather than after the fact.
 
 **Only the node running the guest can be stale.** `deactivate_volume` flushes
 this node's map and `activate_volume` rediscovers the LUN at its current size,

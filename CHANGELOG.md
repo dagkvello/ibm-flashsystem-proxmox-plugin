@@ -30,6 +30,28 @@ the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
   the settle loop now runs against a fixture, and swapping
   `_resize_host_device`'s parameters produces 10 test failures where the
   previous tests stayed green.
+- **A rescan that never landed is no longer indistinguishable from an array
+  that is slow to publish.** `_rescan_paths` skipped unwritable paths
+  silently and discarded `close()` errors, so both failures produced the
+  same log line: the paths did not move. It now returns
+  `(accepted, total, first_error)` and the failure message reports them
+  (`rescans: 4 pass(es), 8 of 8 paths accepted the write`). `$SYSFS_BLOCK`
+  joins the test seams, so `_rescan_paths` is exercised against a fixture
+  `/sys/block` instead of being stubbed out in every test — it was the only
+  sub in the resize path with no coverage at all.
+- **The final verdict re-reads the device.** `$size` was captured before the
+  settle loop and only refreshed inside the branch that had already
+  succeeded, which made `$size = _dev_size($dm) if !defined $size` a no-op.
+  multipathd resizes maps on its own once it notices the paths grew, so a
+  device could be correct at the deadline and still be reported as failed.
+- The failure message and the runbook now name `qm rescan --vmid <id>` for
+  the config half of a failed resize: it reads `volume_size_info` and writes
+  the VM config, so unlike the GUI dialog it cannot grow the array.
+- **The cause of the slow propagation is still open.** Three explanations
+  were tested and falsified (background formatting, array commit latency,
+  rescan thrashing). The same rescan on the same host has taken 5 seconds
+  and has failed to complete in 300. These changes make the failure legible;
+  they do not fix it.
 
 ## Unreleased — 2026-08-26
 
