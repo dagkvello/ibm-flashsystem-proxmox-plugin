@@ -3,6 +3,70 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Unreleased — 2026-08-31
+
+- **Resize verifies the host device instead of assuming it.**
+  `expandvdisksize` returns before the array commits the new capacity to a
+  host `READ CAPACITY`, so a single immediate rescan races it and loses —
+  seen live on a 20G→50G production resize where all 8 paths still read the
+  old size, the plugin returned success, and QEMU failed the guest-side grow
+  with `Cannot grow device files`. Now polls to the requested size and dies
+  naming the array size, the device size, every path size and the recovery.
+  Background formatting is not the blocker: a manual rescan succeeded while
+  the array was still formatting at 44%.
+- **The failure message says DO NOT re-run the resize**, because PVE sizes
+  from `volume_size_info` (answered from the array, already grown) and the
+  GUI only sends increments — so retrying expands the volume a second time,
+  permanently. `activate_volume` now re-syncs capacity best-effort, making
+  stop/start or migrate the supported recovery; previously no operator
+  gesture reached host propagation at all.
+- `_dm_node` no longer assumes `/dev/mapper/<wwid>` is a symlink (it is a
+  real device node without udev), validates the result, falls back to
+  `/sys/block/dm-*/dm/name`, and fails immediately rather than after the
+  full settle budget. The dm node is re-resolved each iteration, so a map
+  reassembled underneath the loop cannot make it check the wrong device.
+- One `lsvdisk` per resize instead of two.
+- `$MAPPER_DIR` and `$RESIZE_SETTLE_TIMEOUT` are documented test seams:
+  the settle loop now runs against a fixture, and swapping
+  `_resize_host_device`'s parameters produces 10 test failures where the
+  previous tests stayed green.
+- **A rescan that never landed is no longer indistinguishable from an array
+  that is slow to publish.** `_rescan_paths` skipped unwritable paths
+  silently and discarded `close()` errors, so both failures produced the
+  same log line: the paths did not move. It now returns
+  `(accepted, total, first_error)` and the failure message reports them
+  (`rescans: 4 pass(es), 8 of 8 paths accepted the write`). `$SYSFS_BLOCK`
+  joins the test seams, so `_rescan_paths` is exercised against a fixture
+  `/sys/block` instead of being stubbed out in every test — it was the only
+  sub in the resize path with no coverage at all.
+- **The final verdict re-reads the device.** `$size` was captured before the
+  settle loop and only refreshed inside the branch that had already
+  succeeded, which made `$size = _dev_size($dm) if !defined $size` a no-op.
+  multipathd resizes maps on its own once it notices the paths grew, so a
+  device could be correct at the deadline and still be reported as failed.
+- The failure message and the runbook now name `qm rescan --vmid <id>` for
+  the config half of a failed resize: it reads `volume_size_info` and writes
+  the VM config, so unlike the GUI dialog it cannot grow the array.
+- **Root cause: Perl taint mode.** PVE runs `pvedaemon` under `perl -T`.
+  Device names come from `readlink()`/`glob()` and are tainted, and Perl
+  allows a tainted path in a read `open()` but refuses it in a write one -
+  so every SCSI rescan this plugin ever issued died with `Insecure
+  dependency in open`, in an `eval`, unchecked, on all 8 paths. `_dev_size`
+  read the same paths fine and a shell `echo 1 > .../rescan` always worked,
+  so the array was blamed for a host-side bug. Found by the rescan
+  accounting above, on its first failure. It also explains why `qm resize`
+  succeeded where the GUI failed: same handler, different process, only one
+  tainted. The array commits in ~40s.
+- **`_flush_device` had the same defect** writing `.../device/delete`, so
+  detach never removed stale SCSI path devices - the exact condition that
+  makes the array's next reuse of a LUN number reassemble the old map. It
+  also discarded the result; it now untaints, counts and warns, and has
+  tests where it previously had none.
+- **The test suite runs under `-T`.** This is the structural fix: the suite
+  stayed green for the whole life of the bug because it ran untainted while
+  production did not. Reinstating either untaint now fails 4 cases for the
+  rescan and 2 for the flush.
+
 ## Unreleased — 2026-08-26
 
 - **Performance endpoint + Datacenter performance section**:

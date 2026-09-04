@@ -217,6 +217,92 @@ arithmetic: had the filter applied, every row would be an alert, so a row
 count above the alert count means it did not, and the total is reported after
 all. The client-side alert/informational split remains either way.
 
+## Host-side resize propagation
+
+`expandvdisksize` returns as soon as the array accepts the request; the new
+capacity is not yet visible to a host `READ CAPACITY`. The sample code, and
+this plugin until v1.0.11, rescanned once immediately and accepted whatever
+came back — which is a race, and it loses. Observed live 2026-08-31: a
+20G→50G resize grew the array, every one of the 8 paths still read 20 GiB,
+the dm map followed them, `volume_resize` returned success, and QEMU failed
+the guest-side grow with `Cannot grow device files` — an error three layers
+from the cause, on a resize the array had already completed. A manual rescan
+minutes later worked instantly.
+
+**The cause was Perl taint mode, and it was never the array.** PVE runs
+`pvedaemon` under `perl -T`. Every device name here comes from `readlink()`
+or `glob()` and is therefore tainted, and Perl permits a tainted path in a
+*read* `open()` while refusing it in a *write* one:
+
+```
+Insecure dependency in open while running with -T switch
+```
+
+So every `echo 1 > /sys/block/<sd>/device/rescan` this plugin issued failed -
+inside an `eval`, unchecked, on all 8 paths, every time - while `_dev_size`
+read those same paths without complaint and the identical write by hand from
+a shell always worked, because a login shell is not tainted. The array
+publishes new capacity in about 40 seconds; the host had simply never asked.
+
+It also explains why `qm resize` from a shell succeeded where the GUI resize
+failed: the same API handler, a different process, and only one of them
+tainted.
+
+Anyone porting this sample into a PVE storage plugin should assume taint mode
+and **run their tests under `-T`**. This suite did not, and stayed green for
+the entire life of the bug. Three plausible explanations - background
+formatting, array commit latency, and rescan thrashing - were investigated
+and falsified before the instrumentation that counted whether the writes were
+accepted at all settled it in one failure.
+
+`_resize_host_device` now checks first, and only if the device is behind does
+it rescan, resize the map and re-check, until the requested size is reached or
+a bounded budget expires — then it **dies**, naming the array size, the device
+size, every path size and the recovery. Failing loudly is the point.
+
+Two things this exposed that are easy to get wrong:
+
+**There is no safe operator retry.** PVE derives its base size from
+`volume_size_info`, which this plugin answers from the array — already grown.
+The GUI resize dialog only ever sends an increment, so re-entering it expands
+the volume a **second** time, permanently, since shrinking is refused. And
+qemu-server early-returns when the requested absolute size already matches, so
+no dialog or `qm resize` gesture reaches host propagation at all. The failure
+message therefore says *do not re-run the resize*, and `activate_volume` now
+re-syncs capacity best-effort, which makes starting or migrating the guest the
+supported recovery. For the config half - the array grown, the VM config left
+behind - `qm rescan --vmid <id>` is the repair: it reads `volume_size_info`
+and writes the config, so unlike the GUI dialog it cannot ask the array to
+grow anything.
+
+**A rescan that never landed looks exactly like a slow array.** Both produce
+the same observable - the paths did not move - and they need opposite
+responses. The first version skipped unwritable paths silently and discarded
+`close()` errors, so the task log could not tell them apart, and a day of
+diagnosis went into a question the instrumentation should have answered.
+`_rescan_paths` returns `(accepted, total, first_error)` and the failure
+message carries them:
+
+```
+rescans: 4 pass(es), 8 of 8 paths accepted the write
+```
+
+`8 of 8` means the writes landed and the array is genuinely not publishing;
+`0 of 8` with an error means the host never asked - which is what it turned
+out to be. Worth building in from the start rather than after the fact.
+
+`_flush_device` carried the identical defect on `.../device/delete`, so the
+detach path had never removed stale SCSI path devices either. That is the
+condition its own comment warns about: the array's next reuse of those LUN
+numbers reassembles the OLD wwid and the new volume never appears. Both write
+sites now pass the device name through a validating untaint - no `/`, so the
+name cannot escape `$SYSFS_BLOCK`, and `.`/`..` refused.
+
+**Only the node running the guest can be stale.** `deactivate_volume` flushes
+this node's map and `activate_volume` rediscovers the LUN at its current size,
+so the other nodes in a cluster hold no device to go stale. An earlier
+assumption that a fleet-wide rescan was needed after every resize was wrong.
+
 ## 4. Performance and per-volume consumption
 
 ### `{storage}/performance`

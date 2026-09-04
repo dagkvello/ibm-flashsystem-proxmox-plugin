@@ -45,6 +45,33 @@ use base qw(PVE::Storage::Plugin);
 
 use constant REST_PORT => 7443;
 
+# How long to wait for a host block device to catch up with an array-side
+# resize.
+#
+# Measured, not guessed. On a FlashSystem 5200 (8.7.0.3) a +1G expand was
+# still not visible to READ CAPACITY after SIXTY seconds of continuous
+# rescanning - all 8 paths held the old size - and the identical rescan issued
+# by hand a few minutes later picked it up at once. So the array's commit can
+# lag well past a minute, and the first cut of this timeout (60s) turned a
+# slow success into a hard failure.
+#
+# Formatting is NOT the mechanism, which is worth writing down because it is
+# the obvious suspect and it is wrong: the successful rescan happened while
+# the volume was still background-formatting at 60%, and an earlier one at
+# 44%. Capacity is published independently of the format.
+#
+# Two minutes. The earlier 300s was compensating for the wrong mechanism -
+# a rescan-per-iteration loop that never let any rescan finish. With a single
+# rescan the kernel re-reads capacity in seconds, so this is margin, not a
+# working figure. The cost of
+# waiting is a resize task that takes a while and says so; the cost of not
+# waiting is a guest that cannot use capacity the array has already committed,
+# and an operator whose only safe recovery is a manual rescan. Note the attach
+# path passes budget => 0 and never waits at all.
+#
+# A variable rather than a constant so the tests can exercise the give-up path
+# in under a second; nothing in production should change it.
+
 # ---- Plugin identity / schema -------------------------------------------
 
 sub type { return 'flashsystem'; }
@@ -237,11 +264,16 @@ sub _vdisk {
 # VALIDATE: assumes multipath uses the WWID as the map name (user_friendly_names
 # off, or an alias mapping the WWID). If you use friendly names, resolve the
 # alias here instead.
+sub _wwid_from_vdisk {
+    my ($v) = @_;
+    my $uid = $v->{vdisk_UID}
+        or die "flashsystem: no vdisk_UID for '" . ($v->{name} // '?') . "'\n";
+    return '3' . lc($uid);
+}
+
 sub _wwid {
     my ($scfg, $volname, $storeid) = @_;
-    my $uid = _vdisk($scfg, $volname, $storeid)->{vdisk_UID}
-        or die "flashsystem: no vdisk_UID for '$volname'\n";
-    return '3' . lc($uid);
+    return _wwid_from_vdisk(_vdisk($scfg, $volname, $storeid));
 }
 
 # ---- Host mapping (tolerant / idempotent) --------------------------------
@@ -287,6 +319,37 @@ sub _rescan_scsi {
     }
 }
 
+# Where the kernel publishes block devices, and where multipath publishes its
+# maps. Variables purely so the tests can drive the device helpers against a
+# fixture; nothing else should set them.
+our $SYSFS_BLOCK = '/sys/block';
+our $MAPPER_DIR  = '/dev/mapper';
+
+# Untaint a sysfs device name, or return undef if it is not one.
+#
+# PVE runs its daemons under `perl -T`, and EVERY device name in this file
+# arrives from readlink() or glob(), so every one of them is tainted. Perl
+# permits tainted paths in a read open() but refuses them in a write open():
+#
+#   Insecure dependency in open while running with -T switch
+#
+# That asymmetry is why this hid for so long. _dev_size read sizes perfectly
+# while every `echo 1 > .../rescan` and every `echo 1 > .../delete` this
+# plugin ever issued failed - in an eval, unchecked, on all 8 paths, every
+# time. From a shell the same writes always worked, so the array took the
+# blame for a host-side bug. Measured live 2026-08-31 once the rescan counted
+# its writes: "0 of 8 paths accepted the write".
+#
+# A regex capture is Perl's untaint operator, so this pattern does real work
+# rather than laundering: no '/' means the name cannot escape $SYSFS_BLOCK,
+# and '.' and '..' are refused outright.
+sub _untaint_dev_name {
+    my ($name) = @_;
+    return undef if !defined $name || !length $name;
+    return undef if $name eq '.' || $name eq '..';
+    return $name =~ /\A([A-Za-z0-9][A-Za-z0-9._-]*)\z/a ? $1 : undef;
+}
+
 # Fully release a LUN from THIS node: flush the multipath map AND delete each
 # underlying SCSI path device. Deleting the sd* devices is essential — if only
 # the map is flushed, the stale path devices linger on the host, and when the
@@ -296,28 +359,48 @@ sub _rescan_scsi {
 sub _flush_device {
     my ($wwid) = @_;
     return 1 if !defined $wwid || !length $wwid;
-    my $map = "/dev/mapper/$wwid";
+    my $map = "$MAPPER_DIR/$wwid";
 
     my @sd;
     if (-e $map) {
         my $target = readlink($map);                   # e.g. "../dm-21"
         my $dm = defined $target ? (split m{/}, $target)[-1] : undef;
-        if (defined $dm && -d "/sys/block/$dm/slaves") {
-            @sd = map { (split m{/}, $_)[-1] } glob "/sys/block/$dm/slaves/*";
+        if (defined $dm && -d "$SYSFS_BLOCK/$dm/slaves") {
+            @sd = map { (split m{/}, $_)[-1] } glob "$SYSFS_BLOCK/$dm/slaves/*";
         }
     }
 
     run_command([ 'multipath', '-f', $wwid ], noerr => 1);
 
+    # Deleting these is not best-effort housekeeping - the comment above is the
+    # bug. A silent failure here leaves stale sd nodes that capture the LUN
+    # number when the array reuses it, so say so instead of discarding it.
+    my ($gone, $stuck, $why) = (0, 0, undef);
     for my $sd (@sd) {
-        my $del = "/sys/block/$sd/device/delete";
-        next if !-w $del;
-        eval {
-            open(my $fh, '>', $del) or die "open $del: $!\n";
-            print {$fh} "1\n";
-            close $fh;
+        my $name = _untaint_dev_name($sd);
+        if (!defined $name) {
+            $stuck++;
+            $why //= "$sd: not a usable device name";
+            next;
+        }
+        my $del = "$SYSFS_BLOCK/$name/device/delete";
+        my $done = eval {
+            open(my $fh, '>', $del) or die "open: $!\n";
+            print {$fh} "1\n" or die "write: $!\n";
+            close $fh or die "close: $!\n";
+            1;
         };
+        if ($done) {
+            $gone++;
+        } else {
+            $stuck++;
+            if (!defined $why) { $why = $@; chomp $why; $why = "$sd: $why"; }
+        }
     }
+    warn sprintf("flashsystem: flushed the map for %s but %d of %d SCSI paths "
+        . "could not be deleted (%s). Stale path devices make the array's next "
+        . "reuse of these LUN numbers reassemble the OLD map.\n",
+        $wwid, $stuck, $gone + $stuck, $why) if $stuck;
     return 1;
 }
 
@@ -326,30 +409,271 @@ sub _flush_device {
 # the new capacity. Re-read each path's capacity, then grow the map. Runs on
 # THIS node only (where the resize is driven); other nodes pick up the new size
 # on their next activate_volume rescan.
-sub _resize_host_device {
-    my ($wwid) = @_;
-    my $map = "/dev/mapper/$wwid";
-    return 1 if !-e $map;
+# Size of a block device from sysfs, in bytes. /sys/block/<dev>/size is in
+# 512-byte sectors regardless of the device's logical block size.
+sub _dev_size {
+    my ($dev) = @_;
+    return undef if !defined $dev || !length $dev;
+    open(my $fh, '<', "$SYSFS_BLOCK/$dev/size") or return undef;
+    my $sectors = <$fh>;
+    close $fh;
+    return undef if !defined $sectors;
+    chomp $sectors;
+    return undef if $sectors !~ /\A\d+\z/a;
+    return $sectors * 512;
+}
 
-    # Resolve the dm-N node so we can rescan its SCSI path slaves.
-    my $target = readlink($map);                       # e.g. "../dm-21"
-    my $dm = defined $target ? (split m{/}, $target)[-1] : undef;
-    if (defined $dm && -d "/sys/block/$dm/slaves") {
-        for my $slave (glob "/sys/block/$dm/slaves/*") {
-            my $sd = (split m{/}, $slave)[-1];         # e.g. "sddu"
-            my $rescan = "/sys/block/$sd/device/rescan";
-            next if !-w $rescan;
-            eval {
-                open(my $fh, '>', $rescan) or die "open $rescan: $!\n";
-                print {$fh} "1\n";
-                close $fh;
-            };
+# The dm-N node behind the mapper entry, or undef when it cannot be named.
+#
+# readlink is the fast path and is already load-bearing elsewhere in this file,
+# but /dev/mapper/<wwid> is only a symlink when udev created it - libdevmapper's
+# fallback makes a real block device node, and then readlink yields nothing.
+# Without a second route that case costs a full settle timeout and then blames
+# the FC paths, which is the same misdirection this change exists to remove.
+sub _dm_node {
+    my ($map) = @_;
+    my $target = readlink($map);
+    if (defined $target) {
+        my $dm = (split m{/}, $target)[-1];
+        # Return the CAPTURE, not $dm: readlink() output is tainted, and an
+        # untainted dm name is what makes the write opens below legal.
+        return $1 if defined $dm && $dm =~ /\A(dm-\d+)\z/a;
+    }
+    # Fall back to the kernel's own name map. Deliberately not stat/rdev
+    # arithmetic: dev_t bit-packing is easy to get subtly wrong in Perl.
+    my $want = (split m{/}, $map)[-1];
+    for my $f (glob "$SYSFS_BLOCK/dm-*/dm/name") {
+        open(my $fh, '<', $f) or next;
+        my $name = <$fh>;
+        close $fh;
+        next if !defined $name;
+        chomp $name;
+        next if $name ne $want;
+        return _untaint_dev_name((split m{/}, $f)[-3]);    # <dm-N> from the path
+    }
+    return undef;
+}
+
+# Ask every SCSI path under a dm node to re-read its capacity.
+#
+# Returns (accepted, total, first_error). The old version skipped unwritable
+# paths silently and threw away close() errors, which made "the rescan never
+# happened" indistinguishable in the task log from "the array is slow to
+# publish the new capacity". Those two need opposite responses, and telling
+# them apart is the entire difficulty of this failure mode - so count the
+# writes that actually landed and report the first one that did not. sysfs
+# surfaces write errors at close() as readily as at print(), so both are
+# checked.
+sub _rescan_paths {
+    my ($dm) = @_;
+    return (0, 0, 'no dm slaves') if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
+    my ($ok, $total, $err) = (0, 0, undef);
+    for my $slave (glob "$SYSFS_BLOCK/$dm/slaves/*") {
+        my $sd = _untaint_dev_name((split m{/}, $slave)[-1]);
+        $total++;
+        if (!defined $sd) {
+            $err //= ((split m{/}, $slave)[-1] // '?') . ': not a usable device name';
+            next;
+        }
+        my $rescan = "$SYSFS_BLOCK/$sd/device/rescan";
+        my $done = eval {
+            open(my $fh, '>', $rescan) or die "open: $!\n";
+            print {$fh} "1\n" or die "write: $!\n";
+            close $fh or die "close: $!\n";
+            1;
+        };
+        if ($done) {
+            $ok++;
+        } elsif (!defined $err) {
+            $err = $@;
+            chomp $err;
+            $err = "$sd: $err";
         }
     }
+    return ($ok, $total, $err);
+}
 
-    # Grow the multipath map to the new path size (idempotent; best-effort).
-    run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
-    return 1;
+sub _paths_min_size {
+    my ($dm) = @_;
+    return undef if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
+    my $min;
+    for my $slave (glob "$SYSFS_BLOCK/$dm/slaves/*") {
+        my $b = _dev_size((split m{/}, $slave)[-1]);
+        return undef if !defined $b;
+        $min = $b if !defined $min || $b < $min;
+    }
+    return $min;
+}
+
+sub _path_sizes {
+    my ($dm) = @_;
+    return 'none' if !defined $dm || !-d "$SYSFS_BLOCK/$dm/slaves";
+    my @p = map {
+        my $sd = (split m{/}, $_)[-1];
+        my $b = _dev_size($sd);
+        "$sd=" . (defined $b ? $b : '?');
+    } glob "$SYSFS_BLOCK/$dm/slaves/*";
+    return @p ? join(' ', @p) : 'none';
+}
+
+our $RESIZE_SETTLE_TIMEOUT = 120;
+
+# Seconds between polls, and between the occasional re-nudge of the SCSI
+# rescan. Variables for the same reason as the timeout: so the tests can drive
+# the loop without spending real wall-clock seconds.
+our $RESIZE_POLL_INTERVAL   = 2;
+our $RESIZE_RESCAN_INTERVAL = 30;
+
+# Propagate an array-side resize to THIS node's block device.
+#
+# expandvdisksize returns as soon as the array accepts the request - the new
+# capacity is not yet visible to a host READ CAPACITY. Rescanning once and
+# accepting whatever comes back is therefore a race, and it loses: observed
+# live 2026-08-31, every path still read the old size, the dm map followed
+# them, and QEMU failed the guest-side grow with "Cannot grow device files" -
+# an error three layers from the cause, on a resize the array had already
+# completed. A manual rescan minutes later succeeded instantly while the array
+# was still background-formatting the added capacity, which rules formatting
+# out and leaves plain timing.
+#
+# So: check, and only if the device is behind, rescan and re-check until it
+# catches up or the budget runs out. The previous version swallowed every
+# error and returned success regardless.
+#
+# best_effort => 1 warns instead of dying, and budget => N overrides the settle
+# time. activate_volume passes both: a device that will not catch up must not
+# stop a VM from starting, and must not delay one either. With budget => 0 it
+# makes exactly ONE corrective pass and never sleeps - the attach path is on
+# every VM start and every migration, so it has to stay cheap even when
+# something is off.
+sub _resize_host_device {
+    my ($wwid, $want, %opt) = @_;
+    my $map = "$MAPPER_DIR/$wwid";
+
+    # Not attached on this node, which is the normal case for every node not
+    # running the guest: deactivate_volume flushes the map, and the next
+    # activate_volume discovers the LUN fresh at its current size. Nothing to
+    # propagate, nothing stale.
+    return 1 if !-e $map;
+
+    my $dm = _dm_node($map);
+    if (!defined $dm) {
+        # Say this immediately. Spending the whole settle budget to report
+        # "unreadable" would point the operator at the FC paths, which are
+        # fine - exactly the misdirection this function exists to end.
+        my $msg = "flashsystem: cannot resolve a dm device for $map; "
+            . "host-side size propagation skipped\n";
+        return _resize_failed($msg, $opt{best_effort});
+    }
+
+    # The common case by far - including every activate_volume - is that the
+    # device is already correct. Check before doing any work.
+    my $size = _dev_size($dm);
+    return 1 if !defined $want || (defined $size && $size >= $want);
+
+    my $budget = defined $opt{budget} ? $opt{budget} : $RESIZE_SETTLE_TIMEOUT;
+    my $deadline = time() + $budget;
+    my $started = time();
+    my $told = 0;
+
+    # Rescan ONCE, then wait for the kernel to finish re-reading capacity.
+    #
+    # The obvious loop - rescan, resize, check, repeat - does not work, and the
+    # way it fails is worth recording. Measured live 2026-08-31: 300 seconds of
+    # rescanning every second left all 8 paths on the old size, and the same
+    # rescan issued by hand with a 5-second pause picked the new size up at
+    # once. Re-triggering a SCSI rescan while one is still in flight appears to
+    # stop any of them completing, so the loop was thrashing the mechanism it
+    # was waiting on. Nudge occasionally; mostly just wait.
+    my ($rok, $rtotal, $rerr) = _rescan_paths($dm);
+    my $passes = 1;
+    my $last_rescan = time();
+    my $settled = 0;
+
+    while (1) {
+        select(undef, undef, undef, $RESIZE_POLL_INTERVAL);
+
+        # The paths carry the array's capacity; the map can only follow them,
+        # so resizing it before they have caught up achieves nothing.
+        my $pmin = _paths_min_size($dm);
+        if (defined $pmin && $pmin >= $want) {
+            run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
+            # Re-resolve: a map reassembled underneath us can land on a
+            # different dm number, and checking the wrong device is how this
+            # would quietly report success again.
+            $dm = _dm_node($map) // $dm;
+            $size = _dev_size($dm);
+            if (defined $size && $size >= $want) {
+                $settled = 1;
+                last;
+            }
+        }
+        last if time() >= $deadline;
+
+        if (time() - $last_rescan >= $RESIZE_RESCAN_INTERVAL) {
+            my ($o, $t, $e) = _rescan_paths($dm);
+            ($rok, $rtotal) = ($o, $t);
+            $rerr = $e if defined $e;
+            $passes++;
+            $last_rescan = time();
+        }
+        # PVE captures stderr into the task log, so a long settle reads as
+        # work rather than as a wedged task.
+        if ($budget > 30 && time() - $started >= $told + 30) {
+            $told = time() - $started;
+            warn sprintf("flashsystem: waiting for %s to reach %d bytes "
+                . "(paths at %s) - %ds of %ds\n",
+                $map, $want, (defined $pmin ? $pmin : 'unreadable'), $told, $budget);
+        }
+    }
+    return 1 if $settled;
+
+    # Nothing above confirmed the device, so $size is still the value read
+    # BEFORE the loop ran - the old `if !defined $size` guard made this a
+    # no-op, because $size was always already defined. Re-read it. multipathd
+    # resizes maps on its own once it notices the paths grew, so the device
+    # can be correct here without any poll having seen it, and reporting the
+    # pre-loop snapshot fails those resizes for no reason.
+    $size = _dev_size($dm);
+    return 1 if defined $size && $size >= $want;
+
+    # NOTE the wording. Do NOT tell the operator to retry the resize: PVE
+    # derives its base size from volume_size_info, which this plugin answers
+    # from the ARRAY - already at the new size. Re-entering the increment in
+    # the GUI therefore expands the array a second time, permanently, because
+    # shrinking is refused. The GUI only ever sends an increment, and
+    # qemu-server early-returns when the absolute requested size already
+    # matches, so there is no dialog gesture that re-runs only this half.
+    # Starting or migrating the guest does, via activate_volume.
+    # Report whether the rescans were even accepted. Without this the log
+    # shows only "the paths did not move", which reads as an array problem
+    # whether the cause was the array or a write this node never made.
+    my $rsum = sprintf("%s pass(es), %s of %s paths accepted the write%s",
+        $passes, (defined $rok ? $rok : '?'), (defined $rtotal ? $rtotal : '?'),
+        (defined $rerr ? "; first error: $rerr" : ''));
+
+    return _resize_failed(sprintf(
+        "flashsystem: the array holds this volume at %d bytes but this node's "
+        . "device is %s and did not catch up within %ds.\n"
+        . "  device: %s\n  paths:  %s\n  rescans: %s\n"
+        . "DO NOT re-run the resize - PVE sizes from the array, so the GUI "
+        . "increment would grow it again and that cannot be undone.\n"
+        . "Recover by rescanning this node: for each path above "
+        . "'echo 1 > /sys/block/<sd>/device/rescan', then "
+        . "'multipathd resize map %s'. Stopping and starting the guest, or "
+        . "migrating it, also re-syncs the device. Once the device is right, "
+        . "'qm rescan --vmid <id>' realigns the VM config, which is the half "
+        . "a failed resize leaves behind - it reads the array and writes the "
+        . "config, so it never grows anything.\n",
+        $want, (defined $size ? "$size bytes" : 'unreadable'),
+        $budget, $map, _path_sizes($dm), $rsum, $wwid), $opt{best_effort});
+}
+
+sub _resize_failed {
+    my ($msg, $best_effort) = @_;
+    die $msg if !$best_effort;
+    warn $msg;
+    return 0;
 }
 
 # ---- Naming --------------------------------------------------------------
@@ -581,8 +905,9 @@ sub activate_volume {
     die "flashsystem: cannot activate a snapshot directly\n" if $snapname;
 
     _map_volume($scfg, $volname, $storeid);
-    my $wwid = _wwid($scfg, $volname, $storeid);
-    my $dev  = "/dev/mapper/$wwid";
+    my $vdisk = _vdisk($scfg, $volname, $storeid);
+    my $wwid  = _wwid_from_vdisk($vdisk);
+    my $dev   = "/dev/mapper/$wwid";
 
     _rescan_scsi();
     run_command([ 'multipath', '-a', $wwid ], noerr => 1);    # whitelist the wwid
@@ -601,6 +926,18 @@ sub activate_volume {
         _flush_device($wwid);
         die "flashsystem: $dev did not appear after mapping '$volname'\n";
     }
+
+    # Re-sync capacity against the array. rescan-scsi-bus.sh -a -r and a plain
+    # `multipath` handle discovery and map assembly; neither re-reads capacity
+    # on a device that was already attached. Without this there is NO operator
+    # gesture that repairs a device left behind by a resize whose host half
+    # failed - the GUI sends only increments and qemu-server early-returns when
+    # the absolute size already matches what the array reports. With it,
+    # stopping and starting the guest, or migrating it, is the fix.
+    #
+    # Best effort on purpose: a capacity mismatch must never stop a VM from
+    # starting, and the fast path here is a single sysfs read.
+    eval { _resize_host_device($wwid, $vdisk->{capacity} + 0, best_effort => 1, budget => 0) };
     return 1;
 }
 
@@ -619,15 +956,26 @@ sub deactivate_volume {
 
 sub volume_resize {
     my ($class, $scfg, $storeid, $volname, $size, $running) = @_;    # $size = new absolute, bytes
-    my $cur = ($class->_vdisk_or_die($scfg, $volname, $storeid))->{capacity} + 0;
+    # One lsvdisk for both the current size and the wwid. The array rate-limits
+    # REST hard enough that a live 429 has been seen from ordinary polling.
+    my $v = $class->_vdisk_or_die($scfg, $volname, $storeid);
+    my $cur = $v->{capacity} + 0;
     die "flashsystem: shrinking is not supported ($cur -> $size)\n" if $size < $cur;
+
     my $delta = $size - $cur;
-    return 1 if $delta == 0;
     # expandvdisksize adds the delta.
-    _cmd($scfg, 'expandvdisksize', _arrayname($scfg, $volname), { size => $delta, unit => 'b' }, storeid => $storeid);
-    # Propagate the new size to this node's block device so the guest can use
-    # it; without this the array grows but /dev/mapper/<wwid> stays the old size.
-    _resize_host_device(_wwid($scfg, $volname, $storeid));
+    _cmd($scfg, 'expandvdisksize', _arrayname($scfg, $volname), { size => $delta, unit => 'b' }, storeid => $storeid)
+        if $delta > 0;
+
+    # Deliberately NOT conditional on $delta, so that any caller arriving with
+    # the array already at the target still gets the host half done. Note this
+    # is a safety net rather than an operator-facing retry: PVE sizes from
+    # volume_size_info (which this plugin answers from the array), and
+    # qemu-server early-returns when the requested absolute size already
+    # matches - so no GUI or `qm resize` gesture reaches here once the array
+    # has grown. activate_volume is the path that actually recovers a device
+    # left behind, which is why it propagates too.
+    _resize_host_device(_wwid_from_vdisk($v), $size);
     return 1;
 }
 
