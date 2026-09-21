@@ -31,6 +31,14 @@ Ext.define('PVE.storage.FlashSystemInputPanel', {
         if (values.fsiogrp?.length === 0) {
             delete values.fsiogrp;
         }
+        ['fsnvmeaddr', 'fsnvmesubnqn', 'fscafile', 'fsvolumegroup', 'fscreate'].forEach((k) => {
+            if (values[k]?.length === 0) {
+                delete values[k];
+            }
+        });
+        if (!values.fsnvmeport) {
+            delete values.fsnvmeport;
+        }
         // LOCAL PATCH (see UPSTREAM.md): a host-cluster-mapped volume is
         // visible to every node by construction, so this storage type is
         // inherently shared. Without this, GUI-created storages defaulted to
@@ -136,16 +144,72 @@ Ext.define('PVE.storage.FlashSystemInputPanel', {
                 boxLabel: gettext('enable (validate firmware first)'),
             },
             {
-                // LOCAL PATCH (fsthin, see UPSTREAM.md): thin-provision NEW
-                // volumes (mkvdisk -rsize 2% -autoexpand). Existing volumes
-                // keep their allocation. Thin = overcommit — make sure
-                // array-side physical-free alerting exists before enabling
-                // on pools shared with other workloads.
+                // Thin-provision NEW volumes via mkvolume -thin (or mkvdisk
+                // -rsize if Create command is mkvdisk). Ignored when the pool
+                // already has a provisioning policy — the policy wins.
                 xtype: 'proxmoxcheckbox',
                 name: 'fsthin',
                 uncheckedValue: 0,
                 fieldLabel: gettext('Thin provision'),
-                boxLabel: gettext('new volumes only'),
+                boxLabel: gettext('new volumes only; ignored if pool has a policy'),
+            },
+            {
+                xtype: me.isCreate ? 'proxmoxKVComboBox' : 'displayfield',
+                name: 'fstransport',
+                fieldLabel: gettext('Transport'),
+                value: 'scsi-fc',
+                comboItems: [
+                    ['scsi-fc', 'SCSI Fibre Channel (dm-multipath)'],
+                    ['nvme-fc', 'NVMe over Fibre Channel'],
+                    ['nvme-tcp', 'NVMe over TCP (Ethernet)'],
+                    ['nvme-rdma', 'NVMe over RDMA'],
+                ],
+            },
+            {
+                xtype: 'textfield',
+                name: 'fsnvmeaddr',
+                value: '',
+                emptyText: gettext('TCP/RDMA IPs, or FC nn-0xWWNN:pn-0xWWPN'),
+                fieldLabel: gettext('NVMe discovery'),
+                allowBlank: true,
+            },
+        ];
+
+        me.advancedColumn2 = [
+            {
+                xtype: me.isCreate ? 'proxmoxKVComboBox' : 'displayfield',
+                name: 'fscreate',
+                fieldLabel: gettext('Create command'),
+                value: 'mkvolume',
+                comboItems: [
+                    ['mkvolume', 'mkvolume (9.x / provisioning policy)'],
+                    ['mkvdisk', 'mkvdisk (8.7 compatible)'],
+                ],
+            },
+            {
+                xtype: 'textfield',
+                name: 'fsvolumegroup',
+                value: '',
+                emptyText: gettext('existing volume group (PBR/PBHA)'),
+                fieldLabel: gettext('Volume group'),
+                allowBlank: true,
+            },
+            {
+                xtype: 'textfield',
+                name: 'fscafile',
+                value: '',
+                emptyText: gettext('/path/to/ca.pem — empty disables TLS verify'),
+                fieldLabel: gettext('TLS CA file'),
+                allowBlank: true,
+            },
+            {
+                xtype: 'numberfield',
+                name: 'fsnvmeport',
+                fieldLabel: gettext('NVMe TCP/RDMA port'),
+                emptyText: '4420',
+                minValue: 1,
+                maxValue: 65535,
+                allowBlank: true,
             },
         ];
 

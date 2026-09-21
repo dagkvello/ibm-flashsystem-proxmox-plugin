@@ -3,6 +3,30 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Local fork — 2026-09-21 (not hardware-validated)
+
+Target: Proxmox VE 9.2 + Storage Virtualize 9.1.3.1 / FlashSystem 7600.
+See `LOCAL.md` and `PBR.md`.
+
+- **JWT / 403:** 9.1 tokens expire wall-clock (default 1 h) with HTTP 403,
+  not 401. `_cmd` re-auths once on either code; JWT `exp` is refreshed 60 s
+  early. Token cache is per `(address, user)`.
+- **`mkvolume` default:** new volumes use `mkvolume` (`pool`, optional
+  `-thin`, optional `volumegroup`). `-thin` is omitted when `lsmdiskgrp`
+  reports a provisioning policy. `fscreate=mkvdisk` keeps the 8.7 path.
+- **Capacity:** `_pool_usage` falls back to 9.x `usable_*` when
+  `physical_*` is absent.
+- **API 14/15:** `api()` clamped to 15; `volume_resize` dies on `$snapname`;
+  `get_identity()` from `lssystem`; `rename_volume` via `chvdisk -name`.
+- **Secrets / TLS:** `fspassword` is a sensitive property (written to the
+  `.pw` file on add/update). Optional `fscafile` turns TLS verify on.
+- **NVMe-oF:** `fstransport=nvme-fc|nvme-tcp|nvme-rdma`, discovery via
+  `fsnvmeaddr`, namespace by NGUID/EUI, native NVMe multipath, controller
+  rescan on resize. Fabric sessions are not torn down on deactivate
+  (disconnect is subsystem-wide).
+- **PBR awareness:** `fsvolumegroup` on create; delete errors name the
+  group instead of stripping the volume out of a consistency group.
+
 ## Unreleased — 2026-08-31
 
 - **Resize verifies the host device instead of assuming it.**

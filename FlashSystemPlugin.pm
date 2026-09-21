@@ -14,20 +14,20 @@ package PVE::Storage::Custom::FlashSystemPlugin;
 #     commands mkvdisk/expandvdisksize.)
 #   - `expandvdisksize` takes the DELTA to add, not an absolute size.
 #
-# Volumes are raw block LUNs, named `vm-<vmid>-disk-<N>` (Proxmox convention),
-# reachable on every node as /dev/mapper/3<vdisk_UID> via FC + multipath. The
-# vdisk is mapped once to the host cluster (`fshostgroup`); each node just
-# rescans on activate and flushes its own multipath map on deactivate. This is
-# what lets proxmox-csi hot-plug the disk onto whichever node runs the pod.
+# Volumes are raw block devices, named `vm-<vmid>-disk-<N>` (Proxmox convention).
+# Transport is selectable:
+#   scsi-fc   (default)  /dev/mapper/3<vdisk_UID> via FC + dm-multipath
+#   nvme-fc              native NVMe multipath (ANA), device by NGUID/EUI
+#   nvme-tcp             NVMe/TCP (Ethernet), same namespace lookup
+#   nvme-rdma            NVMe/RDMA, same namespace lookup
+# The vdisk is mapped once to the host cluster (`fshostgroup`); each node
+# discovers the namespace on activate. SCSI-FC still flushes its own
+# multipath map on deactivate. NVMe-oF leaves the fabric session up (a
+# disconnect is subsystem-wide and would drop every volume on the array).
 #
-# STATUS: validated in production against FlashSystem firmware 8.7 (FC +
-# dm-multipath, 12-node PVE 9.2 cluster): provisioning, live migration,
-# move-disk, resize, snapshots incl. RAM state, delete, Kubernetes CSI
-# volumes. Thin provisioning (fsthin) is validated on a standard pool
-# (firmware 8.7.0.3, FlashSystem 5200) but not yet on a data reduction
-# pool — see the VALIDATE note in _mkvdisk_params. Search this file for
-# "VALIDATE:" for the remaining environment- and firmware-specific
-# decisions to confirm on YOUR array before production.
+# STATUS: SCSI-FC path is production-validated on firmware 8.7 / PVE 9.2.
+# 9.1.3.1 + NVMe-oF + mkvolume/policy path: VALIDATE on a scratch pool
+# before production. Search this file for "VALIDATE:".
 # ---------------------------------------------------------------------------
 
 use strict;
@@ -36,6 +36,9 @@ use warnings;
 use JSON qw(encode_json decode_json);
 use LWP::UserAgent;
 use HTTP::Request;
+use MIME::Base64 qw(decode_base64);
+use File::Basename qw(basename dirname);
+use File::Path qw(make_path);
 
 use PVE::Tools qw(run_command);
 use PVE::Storage;
@@ -44,6 +47,13 @@ use PVE::Storage::Plugin;
 use base qw(PVE::Storage::Plugin);
 
 use constant REST_PORT => 7443;
+# Last storage-plugin API version this module actually implements
+# (qemu_blockdev_options/volume_qemu_snapshot_method via the base class,
+# get_identity, volume_resize $snapname, rename_volume). Hosts newer than
+# this still load us; we do not claim APIVER we have not coded against.
+use constant PLUGIN_APIVER_MAX => 15;
+# Refresh a JWT this many seconds before `exp`.
+use constant JWT_REFRESH_SKEW => 60;
 
 # How long to wait for a host block device to catch up with an array-side
 # resize.
@@ -76,13 +86,21 @@ use constant REST_PORT => 7443;
 
 sub type { return 'flashsystem'; }
 
-# Match whatever the running Proxmox expects, so the module always loads on a
-# supported host instead of being rejected for a hardcoded version.
-sub api { return PVE::Storage::APIVER; }
+# Clamp to the newest API this plugin implements. Claiming the host's APIVER
+# blindly would silence the "older API" warning while skipping new methods.
+sub api {
+    my $host = eval { PVE::Storage::APIVER } // 11;
+    return $host < PLUGIN_APIVER_MAX ? $host : PLUGIN_APIVER_MAX;
+}
 
 sub plugindata {
-    # Block LUNs for VM disk images only.
-    return { content => [ { images => 1, rootdir => 1 }, { images => 1 } ] };
+    # Block devices for VM disk images / CT root disks only.
+    # fspassword is sensitive so PVE keeps it out of storage.cfg when the
+    # add/update hooks run (falls back to the .pw file either way).
+    return {
+        content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
+        'sensitive-properties' => { fspassword => 1 },
+    };
 }
 
 sub properties {
@@ -95,45 +113,132 @@ sub properties {
         fsiogrp   => { description => 'I/O group for new vdisks (default io_grp0)', type => 'string' },
         fssnapshots => { description => 'Enable array snapshots (validate firmware first)', type => 'boolean' },
         fsprefix  => { description => 'Prefix for array-side object names, e.g. the cluster name. Required when several clusters share a pool.', type => 'string' },
-        fsthin    => { description => 'Thin-provision new volumes (mkvdisk -rsize 2% -autoexpand -warning 80%). Affects new volumes only; existing ones keep their allocation.', type => 'boolean' },
+        fsthin    => { description => 'Thin-provision new volumes. Uses mkvolume -thin (or mkvdisk -rsize if fscreate=mkvdisk). Ignored when the pool already has a provisioning policy.', type => 'boolean' },
+        fstransport => {
+            description => 'Host transport: scsi-fc (default), nvme-fc, nvme-tcp, nvme-rdma',
+            type => 'string',
+        },
+        fsnvmeaddr => {
+            description => 'NVMe-oF discovery addresses (comma-separated). TCP/RDMA: IPs. FC: nn-0xWWNN:pn-0xWWPN pairs.',
+            type => 'string',
+        },
+        fsnvmeport => {
+            description => 'NVMe/TCP or NVMe/RDMA discovery port (default 4420)',
+            type => 'integer',
+        },
+        fsnvmesubnqn => {
+            description => 'Optional subsystem NQN. Empty = nvme connect-all discovers it.',
+            type => 'string',
+        },
+        fscafile => {
+            description => 'CA bundle (PEM) to verify the array management certificate. Unset = TLS verify off (legacy).',
+            type => 'string',
+        },
+        fscreate => {
+            description => 'Volume create command: mkvolume (default, 9.x + provisioning policies) or mkvdisk (8.7-compatible).',
+            type => 'string',
+        },
+        fsvolumegroup => {
+            description => 'Existing array volume group to place new volumes in (PBR/PBHA awareness). Must already exist.',
+            type => 'string',
+        },
     };
 }
 
 sub options {
     return {
-        fsaddress   => { fixed => 1 },
-        fspool      => { fixed => 1 },
-        fsuser      => {},
-        fspassword  => { optional => 1 },
-        fshostgroup => {},
-        fsiogrp     => { optional => 1 },
-        fssnapshots => { optional => 1 },
-        fsprefix    => { optional => 1, fixed => 1 },
-        fsthin      => { optional => 1 },
-        content     => { optional => 1 },
-        nodes       => { optional => 1 },
-        disable     => { optional => 1 },
-        shared      => { optional => 1 },
+        fsaddress     => { fixed => 1 },
+        fspool        => { fixed => 1 },
+        fsuser        => {},
+        fspassword    => { optional => 1 },
+        fshostgroup   => {},
+        fsiogrp       => { optional => 1 },
+        fssnapshots   => { optional => 1 },
+        fsprefix      => { optional => 1, fixed => 1 },
+        fsthin        => { optional => 1 },
+        fstransport   => { optional => 1, fixed => 1 },
+        fsnvmeaddr    => { optional => 1 },
+        fsnvmeport    => { optional => 1 },
+        fsnvmesubnqn  => { optional => 1 },
+        fscafile      => { optional => 1 },
+        fscreate      => { optional => 1 },
+        fsvolumegroup => { optional => 1 },
+        content       => { optional => 1 },
+        nodes         => { optional => 1 },
+        disable       => { optional => 1 },
+        shared        => { optional => 1 },
     };
 }
 
 # ---- REST transport ------------------------------------------------------
 
-my $UA = LWP::UserAgent->new(
-    timeout  => 30,
-    # VALIDATE: the array's management cert is typically self-signed. Pin a CA
-    # or import the cert instead of disabling verification for production.
-    ssl_opts => { verify_hostname => 0, SSL_verify_mode => 0 },
-);
+my %UA;        # "$addr|$cafile" -> LWP::UserAgent
+my %TOKENS;    # "$addr|$user"   -> { token => ..., exp => unix|undef }
 
-my %TOKENS;    # fsaddress -> auth token (re-fetched on 401)
+sub _pwfile {
+    my ($storeid) = @_;
+    return undef if !defined $storeid || !length $storeid;
+    return "/etc/pve/priv/storage/$storeid.pw";
+}
+
+sub _store_password {
+    my ($storeid, $pw) = @_;
+    return if !defined $storeid || !defined $pw || !length $pw;
+    my $file = _pwfile($storeid);
+    my $dir = dirname($file);
+    make_path($dir) if !-d $dir;
+    open(my $fh, '>', $file) or die "flashsystem: cannot write $file: $!\n";
+    print {$fh} $pw, "\n";
+    close $fh;
+    chmod 0600, $file;
+    return 1;
+}
+
+sub on_add_hook {
+    my ($class, $storeid, $scfg, %param) = @_;
+    my $pw = $param{fspassword} // $scfg->{fspassword};
+    _store_password($storeid, $pw) if defined $pw && length $pw;
+    delete $scfg->{fspassword};
+    return undef;
+}
+
+sub on_update_hook {
+    my ($class, $storeid, $scfg, %param) = @_;
+    my $pw = $param{fspassword};
+    _store_password($storeid, $pw) if defined $pw && length $pw;
+    delete $scfg->{fspassword};
+    return undef;
+}
+
+sub _ua {
+    my ($scfg) = @_;
+    my $addr = $scfg->{fsaddress} // '';
+    my $ca = $scfg->{fscafile} // '';
+    my $key = "$addr|$ca";
+    return $UA{$key} if $UA{$key};
+
+    my $ssl;
+    if (length $ca) {
+        die "flashsystem: fscafile '$ca' is not a readable file\n" if !-f $ca;
+        $ssl = {
+            verify_hostname => 1,
+            SSL_verify_mode => 1,
+            SSL_ca_file     => $ca,
+        };
+    } else {
+        # VALIDATE: pin fscafile in production. Self-signed management certs
+        # are the array default; 9.1 also allows per-function certificates.
+        $ssl = { verify_hostname => 0, SSL_verify_mode => 0 };
+    }
+    return $UA{$key} = LWP::UserAgent->new(timeout => 30, ssl_opts => $ssl);
+}
 
 sub _password {
     my ($scfg, $storeid) = @_;
     # Prefer a root-only password file over a plaintext value in storage.cfg.
     if (defined $storeid) {
-        my $file = "/etc/pve/priv/storage/$storeid.pw";
-        if (-f $file) {
+        my $file = _pwfile($storeid);
+        if (defined $file && -f $file) {
             my $pw = PVE::Tools::file_read_firstline($file);
             return $pw if defined $pw && length $pw;
         }
@@ -141,16 +246,55 @@ sub _password {
     return $scfg->{fspassword};
 }
 
+# JWT payload is base64url. Opaque (pre-JWT) tokens have no dots; those are
+# never pre-expired here — we wait for 401/403.
+sub _b64url_decode {
+    my ($s) = @_;
+    return undef if !defined $s || !length $s;
+    $s =~ tr/-_/+/;
+    my $mod = length($s) % 4;
+    $s .= '=' x (4 - $mod) if $mod;
+    return eval { decode_base64($s) };
+}
+
+sub _jwt_expiry {
+    my ($tok) = @_;
+    return undef if !defined $tok || $tok !~ /\./;
+    my (undef, $payload) = split /\./, $tok, 3;
+    my $raw = _b64url_decode($payload);
+    return undef if !defined $raw;
+    my $data = eval { decode_json($raw) };
+    return undef if ref($data) ne 'HASH' || !defined $data->{exp};
+    my $exp = $data->{exp};
+    return undef if $exp !~ /\A\d+\z/;
+    return $exp + 0;
+}
+
+# True when the cached token is missing, or a JWT that is at/past exp-skew.
+sub _jwt_needs_refresh {
+    my ($entry) = @_;
+    return 1 if !defined $entry || !defined $entry->{token};
+    return 0 if !defined $entry->{exp};    # opaque token: wait for 401/403
+    return time() >= ($entry->{exp} - JWT_REFRESH_SKEW);
+}
+
+sub _tokkey {
+    my ($scfg) = @_;
+    return ($scfg->{fsaddress} // '') . '|' . ($scfg->{fsuser} // '');
+}
+
 sub _auth {
     my ($scfg, $storeid) = @_;
-    my $addr = $scfg->{fsaddress};
-    return $TOKENS{$addr} if $TOKENS{$addr};
+    my $key = _tokkey($scfg);
+    my $cached = $TOKENS{$key};
+    return $cached->{token} if $cached && !_jwt_needs_refresh($cached);
 
     my $pw = _password($scfg, $storeid);
     die "flashsystem: no REST password (set fspassword or /etc/pve/priv/storage/<id>.pw)\n"
         if !defined $pw || !length $pw;
 
-    my $res = $UA->post(
+    my $addr = $scfg->{fsaddress};
+    my $res = _ua($scfg)->post(
         "https://$addr:" . REST_PORT . "/rest/v1/auth",
         'Content-Type'    => 'application/json',
         'X-Auth-Username' => $scfg->{fsuser},
@@ -159,7 +303,8 @@ sub _auth {
     die "flashsystem: auth failed: " . $res->status_line . "\n" unless $res->is_success;
     my $tok = decode_json($res->decoded_content)->{token}
         or die "flashsystem: auth returned no token\n";
-    return $TOKENS{$addr} = $tok;
+    $TOKENS{$key} = { token => $tok, exp => _jwt_expiry($tok) };
+    return $tok;
 }
 
 # Run one Storage Virtualize command. $target (optional) is a vdisk/pool name
@@ -177,7 +322,7 @@ sub _cmd {
         $req->header('Accept'       => 'application/json');
         $req->header('X-Auth-Token' => $token);
         $req->content(encode_json($params));
-        return $UA->request($req);
+        return _ua($scfg)->request($req);
     };
 
     # LOCAL PATCH (see UPSTREAM.md): retry on HTTP 429. The array throttles
@@ -187,12 +332,18 @@ sub _cmd {
     # Retry-After when it is sane, else back off 1/2/4s. Bounded: under
     # status()'s 10s alarm a sleep is interrupted by ALRM and reported as
     # inactive, exactly as a slow array would be.
+    #
+    # 9.1 JWT expiry is HTTP 403 (not 401), wall-clock, default 1 hour.
+    # Re-auth once on either code, then fail — a second 403 is a real
+    # permission error, not a stale token.
     my @backoff = (1, 2, 4);
     my $res;
+    my $reauthed = 0;
     while (1) {
         $res = $send->(_auth($scfg, $opt{storeid}));
-        if ($res->code == 401) {    # token expired -> re-auth once
-            delete $TOKENS{ $scfg->{fsaddress} };
+        if (($res->code == 401 || $res->code == 403) && !$reauthed) {
+            delete $TOKENS{ _tokkey($scfg) };
+            $reauthed = 1;
             $res = $send->(_auth($scfg, $opt{storeid}));
         }
         last if $res->code != 429 || !@backoff;
@@ -218,6 +369,34 @@ sub _one {
     my ($data) = @_;
     return $data->[0] if ref($data) eq 'ARRAY';
     return $data;
+}
+
+# ---- Transport -----------------------------------------------------------
+
+sub _transport {
+    my ($scfg) = @_;
+    my $t = lc($scfg->{fstransport} // 'scsi-fc');
+    $t =~ s/^\s+|\s+$//g;
+    return 'scsi-fc' if $t eq '' || $t eq 'fc' || $t eq 'scsi' || $t eq 'scsi-fc';
+    return 'nvme-fc' if $t eq 'nvme-fc' || $t eq 'fcnvme' || $t eq 'nvme/fc';
+    return 'nvme-tcp' if $t eq 'nvme-tcp' || $t eq 'tcpnvme' || $t eq 'nvme/tcp';
+    return 'nvme-rdma' if $t eq 'nvme-rdma' || $t eq 'rdmanvme' || $t eq 'nvme/rdma';
+    die "flashsystem: unknown fstransport '$scfg->{fstransport}' "
+        . "(use scsi-fc, nvme-fc, nvme-tcp, or nvme-rdma)\n";
+}
+
+sub _is_nvme {
+    my ($scfg) = @_;
+    return _transport($scfg) =~ /\Anvme-/;
+}
+
+sub _nvme_trtype {
+    my ($scfg) = @_;
+    my $t = _transport($scfg);
+    return 'fc'   if $t eq 'nvme-fc';
+    return 'rdma' if $t eq 'nvme-rdma';
+    return 'tcp'  if $t eq 'nvme-tcp';
+    return undef;
 }
 
 # ---- PVE volname <-> array object name -----------------------------------
@@ -274,6 +453,57 @@ sub _wwid_from_vdisk {
 sub _wwid {
     my ($scfg, $volname, $storeid) = @_;
     return _wwid_from_vdisk(_vdisk($scfg, $volname, $storeid));
+}
+
+# IBM vdisk_UID is 32 hex chars. NVMe namespaces expose it as NGUID/EUI
+# (no NAA-3 prefix). Native NVMe multipath presents one /dev/nvmeXnY.
+sub _uid_hex {
+    my ($v) = @_;
+    my $uid = lc($v->{vdisk_UID} // '');
+    $uid =~ s/[^0-9a-f]//g;
+    return $uid;
+}
+
+sub _nvme_id_candidates {
+    my ($uid) = @_;
+    return () if !defined $uid || !length $uid;
+    my @ids = ("/dev/disk/by-id/nvme-eui.$uid", "/dev/disk/by-id/nvme-nguid.$uid");
+    # Some stacks hyphenate the UUID form of a 32-char NGUID.
+    if (length($uid) == 32) {
+        my $uuid = join '-', unpack('A8A4A4A4A12', $uid);
+        push @ids, "/dev/disk/by-id/nvme-uuid.$uuid";
+    }
+    return @ids;
+}
+
+# Resolve a vdisk to a local NVMe block device. Prefers stable by-id links,
+# then scans sysfs nguid/wwid. Returns undef if the namespace is not here yet.
+sub _nvme_path_from_vdisk {
+    my ($v) = @_;
+    my $uid = _uid_hex($v);
+    return undef if !length $uid;
+    for my $p (_nvme_id_candidates($uid)) {
+        return $p if -e $p;
+    }
+    for my $f (glob('/sys/class/block/nvme*n*/nguid'), glob('/sys/class/block/nvme*n*/wwid')) {
+        open(my $fh, '<', $f) or next;
+        my $val = <$fh>;
+        close $fh;
+        next if !defined $val;
+        $val = lc($val);
+        $val =~ s/[^0-9a-f]//g;
+        next if $val ne $uid && index($val, $uid) < 0;
+        my $dev = basename(dirname($f));
+        $dev = _untaint_dev_name($dev);
+        return "/dev/$dev" if defined $dev;
+    }
+    return undef;
+}
+
+sub _device_path {
+    my ($scfg, $v) = @_;
+    return _nvme_path_from_vdisk($v) if _is_nvme($scfg);
+    return '/dev/mapper/' . _wwid_from_vdisk($v);
 }
 
 # ---- Host mapping (tolerant / idempotent) --------------------------------
@@ -714,7 +944,10 @@ sub path {
     my ($class, $scfg, $volname, $storeid, $snapname) = @_;
     die "flashsystem: snapshot paths are not addressable\n" if defined $snapname;
     my ($vtype, $name, $vmid) = $class->parse_volname($volname);
-    my $path = '/dev/mapper/' . _wwid($scfg, $volname, $storeid);
+    my $v = _vdisk($scfg, $volname, $storeid);
+    my $path = _device_path($scfg, $v)
+        or die "flashsystem: no local device for '$volname' yet (transport "
+        . _transport($scfg) . ")\n";
     return wantarray ? ($path, $vmid, $vtype) : $path;
 }
 
@@ -744,8 +977,72 @@ sub alloc_image {
         if length($aname) > 63;
 
     my $bytes = $size * 1024;    # KiB -> bytes
-    _cmd($scfg, 'mkvdisk', undef, _mkvdisk_params($scfg, $aname, $bytes), storeid => $storeid);
+    _alloc_create($scfg, $aname, $bytes, $storeid);
     return $name;
+}
+
+# Pool has a provisioning policy if lsmdiskgrp names one. 9.x field names
+# vary slightly; treat empty/"none" as absent.
+sub _pool_has_policy {
+    my ($g) = @_;
+    return 0 if ref($g) ne 'HASH';
+    for my $k (qw(provisioning_policy_name provisioning_policy_id provisioning_policy)) {
+        my $v = $g->{$k};
+        next if !defined $v || $v eq '' || lc($v) eq 'none';
+        return 1;
+    }
+    return 0;
+}
+
+# mkvolume parameter set (9.x default). Pool uses `pool`, not `mdiskgrp`.
+# If the pool already has a provisioning policy, do NOT send -thin: the
+# array rejects per-volume capacity-saving flags in that case.
+sub _mkvolume_params {
+    my ($scfg, $aname, $bytes, $has_policy) = @_;
+    my $p = {
+        name  => $aname,
+        pool  => $scfg->{fspool},
+        iogrp => ($scfg->{fsiogrp} // 'io_grp0'),
+        size  => $bytes,
+        unit  => 'b',
+    };
+    if ($scfg->{fsthin} && !$has_policy) {
+        $p->{thin} = JSON::true;
+    }
+    my $vg = $scfg->{fsvolumegroup};
+    $p->{volumegroup} = $vg if defined $vg && length $vg;
+    return $p;
+}
+
+sub _create_cmd {
+    my ($scfg) = @_;
+    my $c = lc($scfg->{fscreate} // 'mkvolume');
+    $c =~ s/^\s+|\s+$//g;
+    return 'mkvdisk' if $c eq 'mkvdisk';
+    return 'mkvolume';
+}
+
+# Probe the pool once (cached on $scfg for the call) so a policy-backed
+# pool does not get -thin/-rsize which 9.x rejects.
+sub _alloc_create {
+    my ($scfg, $aname, $bytes, $storeid) = @_;
+    my $cmd = _create_cmd($scfg);
+    my $has_policy = 0;
+    my $g = eval {
+        _one(_cmd($scfg, 'lsmdiskgrp', $scfg->{fspool}, { bytes => JSON::true }, storeid => $storeid));
+    };
+    $has_policy = _pool_has_policy($g) if $g;
+
+    if ($cmd eq 'mkvolume') {
+        _cmd($scfg, 'mkvolume', undef, _mkvolume_params($scfg, $aname, $bytes, $has_policy),
+            storeid => $storeid);
+        return;
+    }
+    my $p = _mkvdisk_params($scfg, $aname, $bytes);
+    if ($has_policy) {
+        delete $p->{$_} for qw(rsize autoexpand warning);
+    }
+    _cmd($scfg, 'mkvdisk', undef, $p, storeid => $storeid);
 }
 
 # Build the mkvdisk parameter set. Factored out so the thin-provisioning
@@ -793,10 +1090,31 @@ sub free_image {
     # Release this node's block device before removing the vdisk. deactivate_volume
     # normally did this already; repeat it for the direct `pvesm free` path (no VM
     # lifecycle) so we never leave stale SCSI devices behind to mask a future LUN.
-    my $wwid = eval { _wwid($scfg, $volname, $storeid) };
-    _flush_device($wwid) if $wwid;
+    # NVMe-oF: do not disconnect the subsystem (that would drop every namespace).
+    if (!_is_nvme($scfg)) {
+        my $wwid = eval { _wwid($scfg, $volname, $storeid) };
+        _flush_device($wwid) if $wwid;
+    }
     _unmap_volume($scfg, $volname, $storeid);
-    _cmd($scfg, 'rmvdisk', _arrayname($scfg, $volname), {}, storeid => $storeid);
+    eval {
+        _cmd($scfg, 'rmvdisk', _arrayname($scfg, $volname), {}, storeid => $storeid);
+        1;
+    } or do {
+        my $err = $@;
+        # PBR/PBHA awareness: a volume in a replicated volume group or HA
+        # partition cannot always be deleted as a loose vdisk. Fail with the
+        # array message plus the volume-group name rather than auto-removing
+        # it from the consistency group (that would split replication).
+        if ($err =~ /volume group|volumegroup|replication|CMMVC\d+E/i
+            && defined $scfg->{fsvolumegroup} && length $scfg->{fsvolumegroup})
+        {
+            die "flashsystem: cannot delete '$volname' while it belongs to volume group "
+                . "'$scfg->{fsvolumegroup}' (policy-based replication / HA). "
+                . "Remove it from the group on the array, or delete it from the "
+                . "active management system of the partition. Array said: $err";
+        }
+        die $err;
+    };
     return undef;
 }
 
@@ -854,8 +1172,10 @@ sub _pool_usage {
     my $total = ($g->{capacity}      // 0) + 0;
     my $free  = ($g->{free_capacity} // 0) + 0;
     my $used  = ($g->{used_capacity} // ($total - $free)) + 0;
-    my $ptotal = ($g->{physical_capacity}      // 0) + 0;
-    my $pfree  = ($g->{physical_free_capacity} // 0) + 0;
+    # Prefer physical when present (DRP effective capacity overstates free).
+    # 9.x still ships physical_*; some views also expose usable_*.
+    my $ptotal = ($g->{physical_capacity}      // $g->{usable_capacity}      // 0) + 0;
+    my $pfree  = ($g->{physical_free_capacity} // $g->{usable_free_capacity} // 0) + 0;
     if ($ptotal > 0) {
         ($total, $free, $used) = ($ptotal, $pfree, $ptotal - $pfree);
     }
@@ -890,6 +1210,118 @@ sub status {
     return _pool_usage($g);
 }
 
+# ---- NVMe-oF connect / resize -------------------------------------------
+
+# Discover+connect. Idempotent: nvme connect-all is safe if already connected.
+# Addresses come from fsnvmeaddr. For NVMe/FC, some HBA stacks auto-connect
+# after the namespace is mapped; we still try connect-all when addresses
+# are configured.
+sub _nvme_connect {
+    my ($scfg) = @_;
+    my $tr = _nvme_trtype($scfg);
+    return 1 if !defined $tr;
+
+    my @addrs = grep { length } split /[,\s]+/, ($scfg->{fsnvmeaddr} // '');
+    if (!@addrs) {
+        # No discovery addresses: rely on existing sessions / HBA auto-connect.
+        return 1;
+    }
+    my $port = $scfg->{fsnvmeport} // 4420;
+    my $nqn  = $scfg->{fsnvmesubnqn};
+    for my $addr (@addrs) {
+        my @cmd = ('nvme', 'connect-all', '--transport', $tr, '--traddr', $addr);
+        push @cmd, '--trsvcid', $port if $tr ne 'fc';
+        push @cmd, '-n', $nqn if defined $nqn && length $nqn;
+        run_command(\@cmd, noerr => 1);
+    }
+    return 1;
+}
+
+# Ask every NVMe controller to rescan namespaces so a grown volume is visible.
+sub _nvme_rescan {
+    my $n = 0;
+    for my $c (glob '/sys/class/nvme/nvme[0-9]*/rescan_controller') {
+        my $done = eval {
+            open(my $fh, '>', $c) or die "open: $!\n";
+            print {$fh} "1\n" or die "write: $!\n";
+            close $fh or die "close: $!\n";
+            1;
+        };
+        $n++ if $done;
+    }
+    return $n;
+}
+
+sub _block_dev_name {
+    my ($path) = @_;
+    return undef if !defined $path || !length $path;
+    if (-l $path) {
+        my $t = readlink($path);
+        $path = $t if defined $t;
+        $path = "/dev/" . basename($path) if $path !~ m{^/};
+    }
+    return _untaint_dev_name(basename($path));
+}
+
+sub _resize_nvme_device {
+    my ($devpath, $want, %opt) = @_;
+    return 1 if !defined $devpath || !-e $devpath;
+
+    my $name = _block_dev_name($devpath);
+    if (!defined $name) {
+        my $msg = "flashsystem: cannot resolve NVMe device name for $devpath\n";
+        return _resize_failed($msg, $opt{best_effort});
+    }
+    my $size = _dev_size($name);
+    return 1 if !defined $want || (defined $size && $size >= $want);
+
+    my $budget = defined $opt{budget} ? $opt{budget} : $RESIZE_SETTLE_TIMEOUT;
+    my $deadline = time() + $budget;
+    my $passes = 0;
+    _nvme_rescan();
+    $passes++;
+    my $last = time();
+    my $settled = 0;
+    while (1) {
+        select(undef, undef, undef, $RESIZE_POLL_INTERVAL) if $budget > 0;
+        $size = _dev_size($name);
+        if (defined $size && $size >= $want) {
+            $settled = 1;
+            last;
+        }
+        last if time() >= $deadline;
+        if (time() - $last >= $RESIZE_RESCAN_INTERVAL) {
+            _nvme_rescan();
+            $passes++;
+            $last = time();
+        }
+        last if $budget == 0 && $passes >= 1;
+    }
+    $size = _dev_size($name);
+    return 1 if defined $size && $size >= $want;
+    return 1 if $settled;
+    return _resize_failed(sprintf(
+        "flashsystem: the array holds this volume at %d bytes but this node's "
+        . "NVMe device %s is %s and did not catch up within %ds "
+        . "(%d rescan pass(es)).\n"
+        . "DO NOT re-run the resize - PVE sizes from the array, so the GUI "
+        . "increment would grow it again and that cannot be undone.\n"
+        . "Recover with 'nvme ns-rescan /dev/nvmeX' then start/migrate the guest. "
+        . "Once the device is right, 'qm rescan --vmid <id>' realigns the VM config.\n",
+        $want, $devpath, (defined $size ? "$size bytes" : 'unreadable'),
+        $budget, $passes), $opt{best_effort});
+}
+
+sub _resize_attached_device {
+    my ($scfg, $v, $want, %opt) = @_;
+    if (_is_nvme($scfg)) {
+        my $p = _nvme_path_from_vdisk($v);
+        return 1 if !defined $p;    # not attached on this node
+        return _resize_nvme_device($p, $want, %opt);
+    }
+    return _resize_host_device(_wwid_from_vdisk($v), $want, %opt);
+}
+
 # ---- Storage / volume activation ----------------------------------------
 
 sub activate_storage {
@@ -901,13 +1333,39 @@ sub activate_storage {
 sub deactivate_storage { return 1; }
 
 sub activate_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
     die "flashsystem: cannot activate a snapshot directly\n" if $snapname;
+    $hints = $hints;    # API 13; unused (no hint currently applies to raw LUNs)
 
     _map_volume($scfg, $volname, $storeid);
     my $vdisk = _vdisk($scfg, $volname, $storeid);
-    my $wwid  = _wwid_from_vdisk($vdisk);
-    my $dev   = "/dev/mapper/$wwid";
+
+    if (_is_nvme($scfg)) {
+        _nvme_connect($scfg);
+        my $dev;
+        for my $try (1 .. 30) {
+            $dev = _nvme_path_from_vdisk($vdisk);
+            last if defined $dev && -e $dev;
+            _nvme_connect($scfg) if $try % 5 == 0;
+            select(undef, undef, undef, 0.5);
+        }
+        if (!defined $dev || !-e $dev) {
+            die "flashsystem: NVMe namespace for '$volname' (uid "
+                . (_uid_hex($vdisk) || '?')
+                . ") did not appear after mapping. Check fstransport="
+                . _transport($scfg)
+                . ", fsnvmeaddr, nvme_core.multipath=Y, and that the host cluster "
+                . "protocol is NVMe (a volume cannot be mapped to SCSI and NVMe at once).\n";
+        }
+        eval {
+            _resize_attached_device($scfg, $vdisk, $vdisk->{capacity} + 0,
+                best_effort => 1, budget => 0);
+        };
+        return 1;
+    }
+
+    my $wwid = _wwid_from_vdisk($vdisk);
+    my $dev  = "/dev/mapper/$wwid";
 
     _rescan_scsi();
     run_command([ 'multipath', '-a', $wwid ], noerr => 1);    # whitelist the wwid
@@ -937,15 +1395,20 @@ sub activate_volume {
     #
     # Best effort on purpose: a capacity mismatch must never stop a VM from
     # starting, and the fast path here is a single sysfs read.
-    eval { _resize_host_device($wwid, $vdisk->{capacity} + 0, best_effort => 1, budget => 0) };
+    eval {
+        _resize_attached_device($scfg, $vdisk, $vdisk->{capacity} + 0,
+            best_effort => 1, budget => 0);
+    };
     return 1;
 }
 
 sub deactivate_volume {
     my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
     return 1 if $snapname;
-    # The cluster-wide mapping stays until free_image; here we just release this
-    # node's multipath map so the node cleanly detaches (RWO reattach elsewhere).
+    # The cluster-wide mapping stays until free_image.
+    # SCSI-FC: release this node's multipath map so the node cleanly detaches.
+    # NVMe-oF: leave the fabric session; disconnect is subsystem-wide.
+    return 1 if _is_nvme($scfg);
     my $wwid = eval { _wwid($scfg, $volname, $storeid) };
     return 1 if !$wwid;
     _flush_device($wwid);
@@ -955,7 +1418,13 @@ sub deactivate_volume {
 # ---- Resize --------------------------------------------------------------
 
 sub volume_resize {
-    my ($class, $scfg, $storeid, $volname, $size, $running) = @_;    # $size = new absolute, bytes
+    my ($class, $scfg, $storeid, $volname, $size, $running, $snapname) = @_;
+    # API 15: $snapname targets snapshot-as-volume-chain. This plugin has no
+    # addressable snapshots — resizing the live volume instead would be silent
+    # data corruption.
+    die "flashsystem: resizing a snapshot is not supported\n"
+        if defined $snapname && length $snapname;
+
     # One lsvdisk for both the current size and the wwid. The array rate-limits
     # REST hard enough that a live 429 has been seen from ordinary polling.
     my $v = $class->_vdisk_or_die($scfg, $volname, $storeid);
@@ -975,7 +1444,7 @@ sub volume_resize {
     # matches - so no GUI or `qm resize` gesture reaches here once the array
     # has grown. activate_volume is the path that actually recovers a device
     # left behind, which is why it propagates too.
-    _resize_host_device(_wwid_from_vdisk($v), $size);
+    _resize_attached_device($scfg, $v, $size);
     return 1;
 }
 
@@ -1057,9 +1526,48 @@ sub volume_has_feature {
     # target LUN via alloc_image. Not from a snapshot -- snapshots aren't
     # addressable as block devices (see path()).
     return 1 if $feature eq 'copy' && !$snapname;
+    # chvdisk -name: enables qm disk move --target-vmid (API 10 rename).
+    return 1 if $feature eq 'rename' && !$snapname;
     # NB: linked clones / templates ('clone', 'template') are intentionally
     # NOT advertised -- the plugin has no base-image (COW) support.
     return undef;
+}
+
+sub volume_qemu_snapshot_method {
+    my ($class, $storeid, $scfg, $volname) = @_;
+    # Raw array LUNs: QEMU must not take qcow2 internal snapshots.
+    return 'storage';
+}
+
+sub get_identity {
+    my ($class, $scfg, $storeid) = @_;
+    my $sys = eval {
+        _one(_cmd($scfg, 'lssystem', undef, {}, storeid => $storeid));
+    };
+    return $scfg->{fsaddress} if !$sys || ref($sys) ne 'HASH';
+    return $sys->{id} // $sys->{name} // $scfg->{fsaddress};
+}
+
+sub rename_volume {
+    my ($class, $scfg, $storeid, $source_volname, $target_vmid, $target_volname) = @_;
+    $class->parse_volname($source_volname);
+    if (!$target_volname) {
+        $target_volname = $class->find_free_diskname($storeid, $scfg, $target_vmid, 'raw');
+    }
+    die "flashsystem: illegal name '$target_volname' for VM $target_vmid\n"
+        if $target_volname !~ m/\Avm-\Q$target_vmid\E-$VOLNAME_SUFFIX\z/a;
+
+    my $dst = _arrayname($scfg, $target_volname);
+    die 'flashsystem: array object name \'' . $dst . '\' is ' . length($dst)
+        . " chars (max 63)\n"
+        if length($dst) > 63;
+
+    _cmd(
+        $scfg, 'chvdisk', _arrayname($scfg, $source_volname),
+        { name => $dst },
+        storeid => $storeid,
+    );
+    return $target_volname;
 }
 
 1;

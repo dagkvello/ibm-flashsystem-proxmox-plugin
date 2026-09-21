@@ -19,6 +19,8 @@ perl -T t_prefix.pl
 perl -T t_status.pl
 perl -T t_names.pl
 perl -T t_resize.pl
+perl -T t_auth.pl
+perl -T t_nvme.pl
 perl -T t_api.pl
 
 # The GUI render helpers, executed against fixtures with a stubbed ExtJS.

@@ -55,6 +55,15 @@ my $std = {
 # Degenerate: fields present but zero (defensive — must fall back).
 my $zero = { %$drp, physical_capacity => 0, physical_free_capacity => 0 };
 
+# 9.x usable_* fallback when physical_* is absent.
+my $usable = {
+    capacity               => '1000',
+    free_capacity          => '400',
+    used_capacity          => '600',
+    usable_capacity        => '800',
+    usable_free_capacity   => '250',
+};
+
 # status() with a pre-seeded per-cycle cache: no REST happens, so the
 # cache-hit path (tier and k8s storages sharing one pool) and the
 # cached-failure path (down array probed once per cycle, every storage on it
@@ -77,6 +86,8 @@ my @t = (
   ['std free  = free_capacity', ($U->($std))[1],  1099511627776],
   ['std used  = used_capacity', ($U->($std))[2],  1099511627776],
   ['zero physical falls back',  ($U->($zero))[0], 65120294141952],
+  ['9.x usable total',          ($U->($usable))[0], 800],
+  ['9.x usable free',           ($U->($usable))[1], 250],
 );
 
 my $fail = 0;

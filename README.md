@@ -3,8 +3,13 @@
 A custom Proxmox VE storage plugin for **IBM Storage FlashSystem / IBM Storage
 Virtualize**, driving the array's REST API (v1, port 7443) to provision **one
 array volume per VM disk** — created, resized, snapshotted, migrated and
-deleted from the Proxmox GUI, served to the nodes as raw multipath block
-devices over Fibre Channel.
+deleted from the Proxmox GUI, served to the nodes as raw block devices over
+SCSI Fibre Channel (dm-multipath) or NVMe-oF (FC / TCP / RDMA).
+
+This tree is a **local fork** of [olemyk/ibm-flashsystem-proxmox-plugin](https://github.com/olemyk/ibm-flashsystem-proxmox-plugin),
+updated for Proxmox VE 9.2 and Storage Virtualize 9.1.3.1. What changed versus
+upstream is in [LOCAL.md](LOCAL.md). Policy-based replication / HA scope is in
+[PBR.md](PBR.md).
 
 Originally based on the plugin sample in IBM's *Storage Virtualize + Proxmox
 VE* whitepaper, then extended and hardened in production. Every deviation from
@@ -13,7 +18,7 @@ in [CHANGELOG.md](CHANGELOG.md) and the code comments.
 
 ## Status
 
-Validated in production on:
+Validated in production on (upstream SCSI-FC path):
 
 | Component | Version |
 |---|---|
@@ -22,15 +27,21 @@ Validated in production on:
 | Transport | FC, dual fabric, dm-multipath (8 paths/volume), ALUA |
 | Kubernetes | via proxmox-csi (`vm-9999-pvc-<uuid>` volumes) |
 
-Proven operations: on-demand provisioning, online resize, live migration
-(multipath map handover — no data copy), move-disk, full clone, array
-snapshots including RAM state, delete with array-side cleanup, cloud-init
-disks, Kubernetes CSI volumes.
+**This fork** adds 9.1 JWT/403 handling, `mkvolume` + provisioning-policy
+awareness, NVMe-oF (FC/TCP/RDMA), TLS CA pinning, `rename_volume`, and
+volume-group placement. Those paths are unit-tested; they are **not** yet
+validated on a FlashSystem 7600 / 9.1.3.1. Use a scratch pool first.
+
+Proven operations (SCSI-FC, firmware 8.7): on-demand provisioning, online
+resize, live migration (multipath map handover — no data copy), move-disk,
+full clone, array snapshots including RAM state, delete with array-side
+cleanup, cloud-init disks, Kubernetes CSI volumes.
 
 **Not supported:** templates / linked clones (no base-image support — keep
 template VMs on LVM or dir storage; full clones *onto* this storage work),
-snapshot-as-block-device, cross-VM volume reassignment via
-`qm disk move --target-vmid` (attach-by-volid works).
+snapshot-as-block-device. Cross-VM reassignment via `qm disk move --target-vmid`
+now has a `rename_volume` implementation (`chvdisk -name`); VALIDATE it before
+relying on it.
 
 ### What that validation does and does not cover
 
@@ -103,6 +114,21 @@ tests/                          unit tests — run anywhere perl exists, no arra
   changes (an APT Post-Invoke hook works well).
 - Packages: `multipath-tools sg3-utils libwww-perl libjson-perl`.
 - TCP 7443 open from the nodes to the array's management address.
+
+**NVMe-oF extra (every node), when `fstransport` is `nvme-fc` / `nvme-tcp` / `nvme-rdma`:**
+
+- `nvme-cli` installed; `nvme_core.multipath=Y` (native ANA). **Do not** use
+  dm-multipath for NVMe/TCP — IBM requires native multipath there. Blacklist
+  `NVME,IBM 2145` in `multipath.conf`.
+- Host objects on the array must be protocol **NVMe** (`fcnvme` / `tcpnvme` /
+  `rdmanvme`) and grouped in the `fshostgroup` host cluster. A volume cannot
+  be mapped to SCSI and NVMe at the same time.
+- NVMe/TCP or RDMA: set `fsnvmeaddr` to the array data IPs (port 4420 unless
+  you change `fsnvmeport`). Persist discovery with `/etc/nvme/discovery.conf`
+  + `nvmf-autoconnect.service` so reconnect survives reboot.
+- NVMe/FC: zone host WWPNs to the array's **NVMe** FC ports (not the SCSI
+  ones). Some HBAs auto-connect; otherwise put `nn-0xWWNN:pn-0xWWPN` pairs in
+  `fsnvmeaddr`.
 
 ## Install
 
@@ -182,7 +208,14 @@ exactly.
 | `fshostgroup` | no | host cluster on the array |
 | `fsiogrp` | no | I/O group for new volumes (default `io_grp0`) |
 | `fssnapshots` | no | enable array snapshots (firmware ≥ 8.5.1) |
-| `fsthin` | no | thin-provision **new** volumes (`mkvdisk -rsize 2% -autoexpand -warning 80%`) |
+| `fsthin` | no | thin-provision **new** volumes (`mkvolume -thin`, or `mkvdisk -rsize` if `fscreate=mkvdisk`). Ignored when the pool already has a provisioning policy. |
+| `fstransport` | yes | `scsi-fc` (default), `nvme-fc`, `nvme-tcp`, `nvme-rdma` |
+| `fsnvmeaddr` | no | NVMe-oF discovery addresses (comma-separated). TCP/RDMA: IPs. FC: `nn-0xWWNN:pn-0xWWPN`. |
+| `fsnvmeport` | no | NVMe/TCP or NVMe/RDMA port (default `4420`) |
+| `fsnvmesubnqn` | no | optional subsystem NQN; empty = `nvme connect-all` discovers it |
+| `fscreate` | no | `mkvolume` (default, 9.x) or `mkvdisk` (8.7-compatible) |
+| `fsvolumegroup` | no | existing array volume group for new volumes (PBR/PBHA awareness) |
+| `fscafile` | no | PEM CA bundle for the management endpoint. Unset = TLS verify off. |
 
 The standard PVE storage options `content`, `shared`, `nodes` and `disable`
 are accepted as usual; set `--shared 1` (host-cluster-mapped volumes are
@@ -211,10 +244,11 @@ or touch anything outside their own prefix. Rules that follow:
 
 ### Thin provisioning (`fsthin`)
 
-Bare `mkvdisk` creates **fully allocated** volumes — the full provisioned
-size is reserved at creation, and in a data reduction pool that also bypasses
-thin/dedup. `fsthin 1` switches new volumes to `-rsize 2% -autoexpand
--warning 80%`, which behaves the same on standard pools and DRPs.
+New volumes are created with **`mkvolume`** by default (9.x). Bare create
+without `fsthin` is fully allocated. `fsthin 1` adds `mkvolume -thin`; if
+you set `fscreate=mkvdisk` it uses the 8.7 shape
+(`-rsize 2% -autoexpand -warning 80%`) instead. When the pool already has a
+provisioning policy, per-volume thin flags are omitted — the policy wins.
 
 Validated on a standard pool (FlashSystem 5200, firmware 8.7.0.3): a 100 GiB
 volume created with 5 GiB real capacity, reported as *Thin-provisioned* at an
