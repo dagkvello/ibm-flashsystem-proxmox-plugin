@@ -90,5 +90,12 @@ ok_case('feature rename advertised',
 ok_case('qemu snapshot method storage',
     $P->volume_qemu_snapshot_method('s', {}, 'vm-1-disk-0'), 'storage');
 
+my $VA = \&PVE::Storage::Custom::FlashSystemPlugin::_valid_nvme_addr;
+ok_case('tcp ipv4 ok', $VA->('tcp', '10.10.10.1') ? 'yes' : 'no', 'yes');
+ok_case('fc wwpn ok', $VA->('fc', 'nn-0x200400a0b0c0d0e0:pn-0x210400a0b0c0d0e0') ? 'yes' : 'no', 'yes');
+ok_case('fc garbage rejected', $VA->('fc', '10.10.10.1') ? 'yes' : 'no', 'no');
+ok_case('shell metachar rejected', $VA->('tcp', '1.2.3.4;id') ? 'yes' : 'no', 'no');
+ok_case('newline rejected', $VA->('tcp', "10.0.0.1\n") ? 'yes' : 'no', 'no');
+
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall nvme/alloc cases pass\n";
 exit($fail ? 1 : 0);

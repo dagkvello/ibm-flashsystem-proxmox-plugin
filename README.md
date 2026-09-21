@@ -9,7 +9,7 @@ SCSI Fibre Channel (dm-multipath) or NVMe-oF (FC / TCP / RDMA).
 This tree is a **local fork** of [olemyk/ibm-flashsystem-proxmox-plugin](https://github.com/olemyk/ibm-flashsystem-proxmox-plugin),
 updated for Proxmox VE 9.2 and Storage Virtualize 9.1.3.1. What changed versus
 upstream is in [LOCAL.md](LOCAL.md). Policy-based replication / HA scope is in
-[PBR.md](PBR.md).
+[PBR.md](PBR.md). Security findings are in [SECURITY.md](SECURITY.md).
 
 Originally based on the plugin sample in IBM's *Storage Virtualize + Proxmox
 VE* whitepaper, then extended and hardened in production. Every deviation from
@@ -215,7 +215,8 @@ exactly.
 | `fsnvmesubnqn` | no | optional subsystem NQN; empty = `nvme connect-all` discovers it |
 | `fscreate` | no | `mkvolume` (default, 9.x) or `mkvdisk` (8.7-compatible) |
 | `fsvolumegroup` | no | existing array volume group for new volumes (PBR/PBHA awareness) |
-| `fscafile` | no | PEM CA bundle for the management endpoint. Unset = TLS verify off. |
+| `fscafile` | no | PEM CA bundle for the management endpoint. Unset = verify against the host trust store. |
+| `fsinsecure` | no | disable TLS certificate verification (self-signed lab arrays only; logs a one-time warning) |
 
 The standard PVE storage options `content`, `shared`, `nodes` and `disable`
 are accepted as usual; set `--shared 1` (host-cluster-mapped volumes are

@@ -131,8 +131,12 @@ sub properties {
             type => 'string',
         },
         fscafile => {
-            description => 'CA bundle (PEM) to verify the array management certificate. Unset = TLS verify off (legacy).',
+            description => 'PEM CA bundle for the array management certificate. Unset = verify against the host trust store (secure default).',
             type => 'string',
+        },
+        fsinsecure => {
+            description => 'Disable TLS certificate verification. Self-signed lab arrays only; logs a one-time warning.',
+            type => 'boolean',
         },
         fscreate => {
             description => 'Volume create command: mkvolume (default, 9.x + provisioning policies) or mkvdisk (8.7-compatible).',
@@ -161,6 +165,7 @@ sub options {
         fsnvmeport    => { optional => 1 },
         fsnvmesubnqn  => { optional => 1 },
         fscafile      => { optional => 1 },
+        fsinsecure    => { optional => 1 },
         fscreate      => { optional => 1 },
         fsvolumegroup => { optional => 1 },
         content       => { optional => 1 },
@@ -172,12 +177,14 @@ sub options {
 
 # ---- REST transport ------------------------------------------------------
 
-my %UA;        # "$addr|$cafile" -> LWP::UserAgent
-my %TOKENS;    # "$addr|$user"   -> { token => ..., exp => unix|undef }
+my %UA;        # "$addr|$cafile|$insecure" -> LWP::UserAgent
+my %TOKENS;    # "$addr|$user"             -> { token => ..., exp => unix|undef }
+my %PWWARN;    # storeid -> warned about plaintext fspassword
+my %TLSWARN;   # addr -> warned about fsinsecure
 
 sub _pwfile {
     my ($storeid) = @_;
-    return undef if !defined $storeid || !length $storeid;
+    return undef if !defined $storeid || $storeid !~ /\A[A-Za-z0-9][A-Za-z0-9.\-_]*\z/;
     return "/etc/pve/priv/storage/$storeid.pw";
 }
 
@@ -185,11 +192,19 @@ sub _store_password {
     my ($storeid, $pw) = @_;
     return if !defined $storeid || !defined $pw || !length $pw;
     my $file = _pwfile($storeid);
+    die "flashsystem: illegal storage id '$storeid'\n" if !defined $file;
     my $dir = dirname($file);
     make_path($dir) if !-d $dir;
-    open(my $fh, '>', $file) or die "flashsystem: cannot write $file: $!\n";
-    print {$fh} $pw, "\n";
-    close $fh;
+    my $old = umask 0077;
+    my $ok = eval {
+        open(my $fh, '>', $file) or die "open: $!\n";
+        print {$fh} $pw, "\n" or die "write: $!\n";
+        close $fh or die "close: $!\n";
+        1;
+    };
+    my $err = $@;
+    umask $old;
+    die "flashsystem: cannot write $file: $err" if !$ok;
     chmod 0600, $file;
     return 1;
 }
@@ -214,21 +229,21 @@ sub _ua {
     my ($scfg) = @_;
     my $addr = $scfg->{fsaddress} // '';
     my $ca = $scfg->{fscafile} // '';
-    my $key = "$addr|$ca";
+    my $insecure = $scfg->{fsinsecure} ? 1 : 0;
+    my $key = "$addr|$ca|$insecure";
     return $UA{$key} if $UA{$key};
 
     my $ssl;
-    if (length $ca) {
-        die "flashsystem: fscafile '$ca' is not a readable file\n" if !-f $ca;
-        $ssl = {
-            verify_hostname => 1,
-            SSL_verify_mode => 1,
-            SSL_ca_file     => $ca,
-        };
-    } else {
-        # VALIDATE: pin fscafile in production. Self-signed management certs
-        # are the array default; 9.1 also allows per-function certificates.
+    if ($insecure) {
+        warn "flashsystem: TLS certificate verification DISABLED for $addr (fsinsecure=1)\n"
+            unless $TLSWARN{$addr}++;
         $ssl = { verify_hostname => 0, SSL_verify_mode => 0 };
+    } else {
+        $ssl = { verify_hostname => 1, SSL_verify_mode => 1 };
+        if (length $ca) {
+            die "flashsystem: fscafile '$ca' is not a readable file\n" if !-f $ca;
+            $ssl->{SSL_ca_file} = $ca;
+        }
     }
     return $UA{$key} = LWP::UserAgent->new(timeout => 30, ssl_opts => $ssl);
 }
@@ -243,7 +258,14 @@ sub _password {
             return $pw if defined $pw && length $pw;
         }
     }
-    return $scfg->{fspassword};
+    my $pw = $scfg->{fspassword};
+    if (defined $pw && length $pw) {
+        my $id = $storeid // $scfg->{fsaddress} // '';
+        warn "flashsystem: using plaintext fspassword for storage '$id'; "
+            . "prefer /etc/pve/priv/storage/<id>.pw\n"
+            unless $PWWARN{$id}++;
+    }
+    return $pw;
 }
 
 # JWT payload is base64url. Opaque (pre-JWT) tokens have no dots; those are
@@ -283,6 +305,52 @@ sub _tokkey {
     return ($scfg->{fsaddress} // '') . '|' . ($scfg->{fsuser} // '');
 }
 
+sub _decode_json_checked {
+    my ($body, $label) = @_;
+    return undef if !defined $body || !length $body;
+    my $data = eval { decode_json($body) };
+    return $data if !$@;
+    my $shown = $body;
+    $shown = substr($shown, 0, 200) . '...' if length($shown) > 200;
+    $shown =~ s/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/[jwt-redacted]/g;
+    die "flashsystem: $label: bad JSON response: $shown\n";
+}
+
+# Bounded HTTP retry. $max_attempts is the total number of $cb invocations
+# for 429/5xx/transport errors (default 3 => at most 1+2+4s extra sleep,
+# which still fits under status()'s 10s alarm). A single 401/403 re-auth
+# is extra and does not consume a 429 slot.
+sub _request_with_retry {
+    my ($cb, %opt) = @_;
+    my $max = $opt{max_attempts} // 3;
+    $max = 1 if $max < 1;
+    my $reauthed = 0;
+    my $attempt = 0;
+    my $res;
+    while ($attempt < $max) {
+        $attempt++;
+        eval { $res = $cb->(); 1 } or do {
+            my $err = $@;
+            die $err if !_is_retryable_transport($err) || $attempt >= $max;
+            _sleep(_retry_delay(undef, $attempt - 1));
+            next;
+        };
+        die "flashsystem: empty HTTP response\n"
+            if !defined $res || !$res->can('code');
+        if ($opt{on_unauthorized} && !$reauthed
+            && ($res->code == 401 || $res->code == 403))
+        {
+            $opt{on_unauthorized}->();
+            $reauthed = 1;
+            $attempt--;
+            next;
+        }
+        last if !_is_retryable_http($res) || $attempt >= $max;
+        _sleep(_retry_delay($res, $attempt - 1));
+    }
+    return $res;
+}
+
 sub _auth {
     my ($scfg, $storeid) = @_;
     my $key = _tokkey($scfg);
@@ -294,14 +362,19 @@ sub _auth {
         if !defined $pw || !length $pw;
 
     my $addr = $scfg->{fsaddress};
-    my $res = _ua($scfg)->post(
-        "https://$addr:" . REST_PORT . "/rest/v1/auth",
-        'Content-Type'    => 'application/json',
-        'X-Auth-Username' => $scfg->{fsuser},
-        'X-Auth-Password' => $pw,
+    my $res = _request_with_retry(
+        sub {
+            return _ua($scfg)->post(
+                "https://$addr:" . REST_PORT . "/rest/v1/auth",
+                'Content-Type'    => 'application/json',
+                'X-Auth-Username' => $scfg->{fsuser},
+                'X-Auth-Password' => $pw,
+            );
+        },
+        max_attempts => 2,
     );
-    die "flashsystem: auth failed: " . $res->status_line . "\n" unless $res->is_success;
-    my $tok = decode_json($res->decoded_content)->{token}
+    die "flashsystem: auth failed: " . $res->status_line . "\n" unless $res && $res->is_success;
+    my $tok = _decode_json_checked($res->decoded_content, 'auth')->{token}
         or die "flashsystem: auth returned no token\n";
     $TOKENS{$key} = { token => $tok, exp => _jwt_expiry($tok) };
     return $tok;
@@ -325,42 +398,25 @@ sub _cmd {
         return _ua($scfg)->request($req);
     };
 
-    # LOCAL PATCH (see UPSTREAM.md): retry on HTTP 429. The array throttles
-    # its REST API, and the steady-state load is real — pvestatd polls every
-    # flashsystem storage from every node — so any provisioning burst on top
-    # (a template import, CSI churn) can draw 429 on an unlucky call. Honor
-    # Retry-After when it is sane, else back off 1/2/4s. Bounded: under
-    # status()'s 10s alarm a sleep is interrupted by ALRM and reported as
-    # inactive, exactly as a slow array would be.
-    #
-    # 9.1 JWT expiry is HTTP 403 (not 401), wall-clock, default 1 hour.
-    # Re-auth once on either code, then fail — a second 403 is a real
-    # permission error, not a stale token.
-    my @backoff = (1, 2, 4);
-    my $res;
-    my $reauthed = 0;
-    while (1) {
-        $res = $send->(_auth($scfg, $opt{storeid}));
-        if (($res->code == 401 || $res->code == 403) && !$reauthed) {
+    my $res = _request_with_retry(
+        sub {
+            my $token = _auth($scfg, $opt{storeid});
+            return $send->($token);
+        },
+        max_attempts => 3,
+        on_unauthorized => sub {
             delete $TOKENS{ _tokkey($scfg) };
-            $reauthed = 1;
-            $res = $send->(_auth($scfg, $opt{storeid}));
-        }
-        last if $res->code != 429 || !@backoff;
-        my $delay = shift @backoff;
-        my $ra = $res->header('Retry-After');
-        $delay = $ra if defined $ra && $ra =~ /^\d{1,2}$/ && $ra >= 1 && $ra <= 10;
-        sleep $delay;
-    }
+        },
+    );
 
+    die "flashsystem: $command failed: empty HTTP response\n"
+        if !defined $res || !$res->can('code');
     my $body = $res->decoded_content // '';
     if (!$res->is_success) {
         die "flashsystem: $command failed: " . $res->status_line . " $body\n";
     }
     return undef if !length $body;
-    my $data = eval { decode_json($body) };
-    die "flashsystem: $command: bad JSON response: $body\n" if $@;
-    return $data;
+    return _decode_json_checked($body, $command);
 }
 
 # lsvdisk/lsmdiskgrp for a single object return a 1-element array on some
@@ -370,6 +426,38 @@ sub _one {
     return $data->[0] if ref($data) eq 'ARRAY';
     return $data;
 }
+
+sub _is_retryable_http {
+    my ($res) = @_;
+    return 0 if !defined $res;
+    my $code = $res->code || 0;
+    return 1 if $code == 408 || $code == 429 || ($code >= 500 && $code <= 599);
+    return 0;
+}
+
+sub _is_retryable_transport {
+    my ($err) = @_;
+    return 0 if !defined $err || !length $err;
+    # Certificate failures will not succeed on retry — do not stall pvestatd.
+    return 0 if $err =~ /certificate verify failed|self.signed|hostname mismatch|unable to get local issuer/i;
+    return 1 if $err =~ /timed out|timeout|Connection refused|Connection reset|reset by peer|Temporary failure in name resolution|Network is unreachable|Broken pipe/i;
+    return 0;
+}
+
+sub _retry_delay {
+    my ($res, $attempt) = @_;
+    my $ra = $res ? $res->header('Retry-After') : undef;
+    if (defined $ra && $ra =~ /^\d+$/ && $ra >= 1 && $ra <= 10) {
+        return $ra + 0;
+    }
+    # Cap at 4s: status() has a 10s alarm; 1+2+4 fits, 8 does not.
+    my @backoff = (1, 2, 4);
+    return $backoff[$attempt] if defined $attempt && $attempt >= 0 && $attempt < @backoff;
+    return 4;
+}
+
+# Test seam: the suite stubs this so retry tests do not sleep wall-clock.
+sub _sleep { sleep $_[0] if $_[0]; }
 
 # ---- Transport -----------------------------------------------------------
 
@@ -535,6 +623,16 @@ sub _unmap_volume {
 
 # ---- Host-side block device plumbing ------------------------------------
 
+sub _run_host_cmd {
+    my ($cmd, $label, %opt) = @_;
+    my $rc = run_command($cmd, noerr => 1);
+    if ($rc != 0 && !$opt{quiet}) {
+        my $name = defined $label ? $label : join(' ', @$cmd);
+        warn "flashsystem: host command failed ($rc): $name\n";
+    }
+    return $rc;
+}
+
 sub _rescan_scsi {
     # Prefer sg3-utils. Pass -r (remove) alongside -a (add) so a LUN whose
     # identity changed -- a reused LUN slot, or a volume whose vdisk_UID differs
@@ -542,10 +640,17 @@ sub _rescan_scsi {
     # device that masks the new wwid (multipath would assemble the OLD map and
     # the expected /dev/mapper/3<UID> never appears). -a alone cannot refresh a
     # changed LUN. This is what makes cross-node reattach self-heal.
-    if (run_command([ 'sh', '-c', 'command -v rescan-scsi-bus.sh >/dev/null 2>&1' ], noerr => 1) == 0) {
-        run_command([ 'rescan-scsi-bus.sh', '-a', '-r' ], noerr => 1);
+    if (_run_host_cmd(
+            [ 'sh', '-c', 'command -v rescan-scsi-bus.sh >/dev/null 2>&1' ],
+            'check rescan-scsi-bus.sh', quiet => 1,
+        ) == 0)
+    {
+        _run_host_cmd([ 'rescan-scsi-bus.sh', '-a', '-r' ], 'rescan-scsi-bus.sh -a -r');
     } else {
-        run_command([ 'sh', '-c', 'for h in /sys/class/scsi_host/host*/scan; do echo "- - -" > "$h"; done' ], noerr => 1);
+        _run_host_cmd(
+            [ 'sh', '-c', 'for h in /sys/class/scsi_host/host*/scan; do echo "- - -" > "$h"; done' ],
+            'host scan reset',
+        );
     }
 }
 
@@ -580,6 +685,23 @@ sub _untaint_dev_name {
     return $name =~ /\A([A-Za-z0-9][A-Za-z0-9._-]*)\z/a ? $1 : undef;
 }
 
+# Returns (ok, error). Callers own the warning — this must not swallow $@
+# (the 2026-08-31 resize diagnosis depends on the error reaching the task log).
+sub _write_sysfs_value {
+    my ($path, $value) = @_;
+    return (0, 'no path') if !defined $path || !length $path;
+    my $done = eval {
+        open(my $fh, '>', $path) or die "open: $!\n";
+        print {$fh} $value or die "write: $!\n";
+        close $fh or die "close: $!\n";
+        1;
+    };
+    return (1, undef) if $done;
+    my $msg = $@ // 'write failed';
+    chomp $msg;
+    return (0, $msg);
+}
+
 # Fully release a LUN from THIS node: flush the multipath map AND delete each
 # underlying SCSI path device. Deleting the sd* devices is essential — if only
 # the map is flushed, the stale path devices linger on the host, and when the
@@ -600,7 +722,7 @@ sub _flush_device {
         }
     }
 
-    run_command([ 'multipath', '-f', $wwid ], noerr => 1);
+    _run_host_cmd([ 'multipath', '-f', $wwid ], "multipath -f $wwid");
 
     # Deleting these is not best-effort housekeeping - the comment above is the
     # bug. A silent failure here leaves stale sd nodes that capture the LUN
@@ -614,17 +736,12 @@ sub _flush_device {
             next;
         }
         my $del = "$SYSFS_BLOCK/$name/device/delete";
-        my $done = eval {
-            open(my $fh, '>', $del) or die "open: $!\n";
-            print {$fh} "1\n" or die "write: $!\n";
-            close $fh or die "close: $!\n";
-            1;
-        };
+        my ($done, $werr) = _write_sysfs_value($del, "1\n");
         if ($done) {
             $gone++;
         } else {
             $stuck++;
-            if (!defined $why) { $why = $@; chomp $why; $why = "$sd: $why"; }
+            $why //= "$sd: " . ($werr // 'write failed');
         }
     }
     warn sprintf("flashsystem: flushed the map for %s but %d of %d SCSI paths "
@@ -706,18 +823,11 @@ sub _rescan_paths {
             next;
         }
         my $rescan = "$SYSFS_BLOCK/$sd/device/rescan";
-        my $done = eval {
-            open(my $fh, '>', $rescan) or die "open: $!\n";
-            print {$fh} "1\n" or die "write: $!\n";
-            close $fh or die "close: $!\n";
-            1;
-        };
+        my ($done, $werr) = _write_sysfs_value($rescan, "1\n");
         if ($done) {
             $ok++;
-        } elsif (!defined $err) {
-            $err = $@;
-            chomp $err;
-            $err = "$sd: $err";
+        } else {
+            $err //= "$sd: " . ($werr // 'write failed');
         }
     }
     return ($ok, $total, $err);
@@ -827,7 +937,7 @@ sub _resize_host_device {
         # so resizing it before they have caught up achieves nothing.
         my $pmin = _paths_min_size($dm);
         if (defined $pmin && $pmin >= $want) {
-            run_command([ 'multipathd', 'resize', 'map', $wwid ], noerr => 1);
+            _run_host_cmd([ 'multipathd', 'resize', 'map', $wwid ], "multipathd resize map $wwid");
             # Re-resolve: a map reassembled underneath us can land on a
             # different dm number, and checking the wrong device is how this
             # would quietly report success again.
@@ -1227,26 +1337,41 @@ sub _nvme_connect {
         return 1;
     }
     my $port = $scfg->{fsnvmeport} // 4420;
-    my $nqn  = $scfg->{fsnvmesubnqn};
+    die "flashsystem: fsnvmeport must be 1-65535\n"
+        if $port !~ /\A\d+\z/ || $port < 1 || $port > 65535;
+    my $nqn = $scfg->{fsnvmesubnqn};
+    die "flashsystem: fsnvmesubnqn contains illegal characters\n"
+        if defined $nqn && length $nqn && $nqn !~ /\A[A-Za-z0-9._:=-]+\z/;
     for my $addr (@addrs) {
+        die "flashsystem: illegal NVMe discovery address '$addr'\n"
+            unless _valid_nvme_addr($tr, $addr);
         my @cmd = ('nvme', 'connect-all', '--transport', $tr, '--traddr', $addr);
         push @cmd, '--trsvcid', $port if $tr ne 'fc';
         push @cmd, '-n', $nqn if defined $nqn && length $nqn;
-        run_command(\@cmd, noerr => 1);
+        my $rc = _run_host_cmd(\@cmd, join(' ', @cmd));
+        if ($rc != 0) {
+            warn "flashsystem: NVMe discovery failed for $addr via $tr\n";
+        }
     }
     return 1;
+}
+
+sub _valid_nvme_addr {
+    my ($tr, $addr) = @_;
+    return 0 if !defined $addr || !length $addr || $addr =~ /[\x00-\x1f]/;
+    if ($tr eq 'fc') {
+        return $addr =~ /\Ann-0x[0-9a-fA-F]+:pn-0x[0-9a-fA-F]+\z/;
+    }
+    return $addr =~ /\A[A-Za-z0-9.:\[\]-]+\z/;
 }
 
 # Ask every NVMe controller to rescan namespaces so a grown volume is visible.
 sub _nvme_rescan {
     my $n = 0;
     for my $c (glob '/sys/class/nvme/nvme[0-9]*/rescan_controller') {
-        my $done = eval {
-            open(my $fh, '>', $c) or die "open: $!\n";
-            print {$fh} "1\n" or die "write: $!\n";
-            close $fh or die "close: $!\n";
-            1;
-        };
+        # glob() taints the path; write opens are refused under perl -T.
+        next if $c !~ m{\A(/sys/class/nvme/nvme\d+/rescan_controller)\z};
+        my ($done) = _write_sysfs_value($1, "1\n");
         $n++ if $done;
     }
     return $n;
@@ -1332,48 +1457,43 @@ sub activate_storage {
 
 sub deactivate_storage { return 1; }
 
-sub activate_volume {
-    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
-    die "flashsystem: cannot activate a snapshot directly\n" if $snapname;
-    $hints = $hints;    # API 13; unused (no hint currently applies to raw LUNs)
-
-    _map_volume($scfg, $volname, $storeid);
-    my $vdisk = _vdisk($scfg, $volname, $storeid);
-
-    if (_is_nvme($scfg)) {
-        _nvme_connect($scfg);
-        my $dev;
-        for my $try (1 .. 30) {
-            $dev = _nvme_path_from_vdisk($vdisk);
-            last if defined $dev && -e $dev;
-            _nvme_connect($scfg) if $try % 5 == 0;
-            select(undef, undef, undef, 0.5);
-        }
-        if (!defined $dev || !-e $dev) {
-            die "flashsystem: NVMe namespace for '$volname' (uid "
-                . (_uid_hex($vdisk) || '?')
-                . ") did not appear after mapping. Check fstransport="
-                . _transport($scfg)
-                . ", fsnvmeaddr, nvme_core.multipath=Y, and that the host cluster "
-                . "protocol is NVMe (a volume cannot be mapped to SCSI and NVMe at once).\n";
-        }
-        eval {
-            _resize_attached_device($scfg, $vdisk, $vdisk->{capacity} + 0,
-                best_effort => 1, budget => 0);
-        };
-        return 1;
+sub _activate_nvme_volume {
+    my ($scfg, $volname, $vdisk) = @_;
+    _nvme_connect($scfg);
+    my $dev;
+    for my $try (1 .. 30) {
+        $dev = _nvme_path_from_vdisk($vdisk);
+        last if defined $dev && -e $dev;
+        _nvme_connect($scfg) if $try % 5 == 0;
+        select(undef, undef, undef, 0.5);
     }
+    if (!defined $dev || !-e $dev) {
+        die "flashsystem: NVMe namespace for '$volname' (uid "
+            . (_uid_hex($vdisk) || '?')
+            . ") did not appear after mapping. Check fstransport="
+            . _transport($scfg)
+            . ", fsnvmeaddr, nvme_core.multipath=Y, and that the host cluster "
+            . "protocol is NVMe (a volume cannot be mapped to SCSI and NVMe at once).\n";
+    }
+    eval {
+        _resize_attached_device($scfg, $vdisk, $vdisk->{capacity} + 0,
+            best_effort => 1, budget => 0);
+    };
+    return 1;
+}
 
+sub _activate_scsi_volume {
+    my ($scfg, $volname, $vdisk) = @_;
     my $wwid = _wwid_from_vdisk($vdisk);
     my $dev  = "/dev/mapper/$wwid";
 
     _rescan_scsi();
-    run_command([ 'multipath', '-a', $wwid ], noerr => 1);    # whitelist the wwid
-    run_command([ 'multipath' ],             noerr => 1);     # (re)assemble maps
+    _run_host_cmd([ 'multipath', '-a', $wwid ], "multipath -a $wwid");    # whitelist the wwid
+    _run_host_cmd([ 'multipath' ], 'multipath');     # (re)assemble maps
 
     for my $try (1 .. 30) {
         last if -e $dev;
-        run_command([ 'multipath' ], noerr => 1) if $try % 5 == 0;
+        _run_host_cmd([ 'multipath' ], 'multipath refresh') if $try % 5 == 0;
         select(undef, undef, undef, 0.5);
     }
     if (!-e $dev) {
@@ -1400,6 +1520,18 @@ sub activate_volume {
             best_effort => 1, budget => 0);
     };
     return 1;
+}
+
+sub activate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache, $hints) = @_;
+    die "flashsystem: cannot activate a snapshot directly\n" if $snapname;
+    $hints = $hints;    # API 13; unused (no hint currently applies to raw LUNs)
+
+    _map_volume($scfg, $volname, $storeid);
+    my $vdisk = _vdisk($scfg, $volname, $storeid);
+
+    return _activate_nvme_volume($scfg, $volname, $vdisk) if _is_nvme($scfg);
+    return _activate_scsi_volume($scfg, $volname, $vdisk);
 }
 
 sub deactivate_volume {

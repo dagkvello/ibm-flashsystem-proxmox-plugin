@@ -198,6 +198,15 @@ sub _budget {
     return $left < $cap ? $left : $cap;
 }
 
+sub _section_error {
+    my ($err) = @_;
+    return 'timeout' if ref($err) eq $TIMEOUT_CLASS;
+    return 'auth' if defined $err && $err =~ /401|403|auth failed|no REST password|authentication|authorization/i;
+    return 'transient REST' if defined $err && $err =~ /429|500|502|503|504|timed out|timeout|connection reset|Temporary failure|EOF/i;
+    return 'bad JSON' if defined $err && $err =~ /bad JSON response|JSON/i;
+    return 'backend';
+}
+
 # One bounded REST call per section; failures become {error} entries so the
 # panel renders partial data instead of nothing.
 sub _section {
@@ -221,7 +230,7 @@ sub _section {
             return undef;
         }
         chomp $err;
-        $errors->{$key} = $err;
+        $errors->{$key} = _section_error($err) . ': ' . $err;
         return undef;
     }
     return $res;

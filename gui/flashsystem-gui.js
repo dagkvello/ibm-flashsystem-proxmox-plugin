@@ -198,9 +198,16 @@ Ext.define('PVE.storage.FlashSystemInputPanel', {
                 xtype: 'textfield',
                 name: 'fscafile',
                 value: '',
-                emptyText: gettext('/path/to/ca.pem — empty disables TLS verify'),
+                emptyText: gettext('/path/to/ca.pem — empty uses the host trust store'),
                 fieldLabel: gettext('TLS CA file'),
                 allowBlank: true,
+            },
+            {
+                xtype: 'proxmoxcheckbox',
+                name: 'fsinsecure',
+                uncheckedValue: 0,
+                fieldLabel: gettext('Insecure TLS'),
+                boxLabel: gettext('skip certificate verify (self-signed lab only)'),
             },
             {
                 xtype: 'numberfield',

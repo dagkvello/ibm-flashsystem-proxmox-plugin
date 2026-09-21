@@ -3,6 +3,17 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Security review — 2026-09-21
+
+Copilot pass reviewed and corrected. See `SECURITY.md`.
+
+- TLS verify on by default; `fsinsecure=1` for self-signed lab arrays.
+- Sysfs helpers return the error string (do not swallow `$@`).
+- HTTP retry: 3 attempts, 1/2/4s backoff, no retry of cert failures, 401/403 re-auth once.
+- NVMe discovery address/port/NQN validation; NVMe rescan paths untainted.
+- Password file: umask 0077, validated storage id; plaintext `fspassword` warns once.
+- Health section errors classified without breaking timeout detection.
+
 ## Local fork — 2026-09-21 (not hardware-validated)
 
 Target: Proxmox VE 9.2 + Storage Virtualize 9.1.3.1 / FlashSystem 7600.

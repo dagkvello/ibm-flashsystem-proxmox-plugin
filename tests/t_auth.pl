@@ -69,5 +69,63 @@ ok_case('jwt inside skew needs refresh',
 ok_case('tokkey includes user',
     $KEY->({ fsaddress => 'a', fsuser => 'rest' }), 'a|rest');
 
+my $RT = \&PVE::Storage::Custom::FlashSystemPlugin::_is_retryable_transport;
+my $RD = \&PVE::Storage::Custom::FlashSystemPlugin::_retry_delay;
+ok_case('retry timeout', $RT->('read timed out') ? 'yes' : 'no', 'yes');
+ok_case('retry conn refused', $RT->('Connection refused') ? 'yes' : 'no', 'yes');
+ok_case('do not retry cert fail',
+    $RT->('certificate verify failed') ? 'yes' : 'no', 'no');
+ok_case('do not retry self-signed',
+    $RT->('self signed certificate') ? 'yes' : 'no', 'no');
+ok_case('do not retry auth die', $RT->('flashsystem: auth failed: 403') ? 'yes' : 'no', 'no');
+ok_case('backoff 0 is 1s', $RD->(undef, 0), 1);
+ok_case('backoff 2 is 4s', $RD->(undef, 2), 4);
+ok_case('backoff never 8s', $RD->(undef, 3), 4);
+
+{
+    no warnings 'redefine';
+    my $slept = 0;
+    local *PVE::Storage::Custom::FlashSystemPlugin::_sleep = sub { $slept += $_[0] // 0 };
+    my $n = 0;
+    eval {
+        PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+            sub { $n++; die "Connection refused\n"; },
+            max_attempts => 3,
+        );
+    };
+    ok_case('transport retry count', $n, 3);
+    ok_case('transport retry gives up', ($@ =~ /Connection refused/ ? 'yes' : "no:$@"), 'yes');
+    ok_case('transport retry slept', ($slept >= 3 ? 'yes' : "no:$slept"), 'yes');
+
+    $n = 0;
+    eval {
+        PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+            sub { $n++; die "certificate verify failed\n"; },
+            max_attempts => 3,
+        );
+    };
+    ok_case('cert fail is not retried', ($@ =~ /certificate verify failed/ ? 'yes' : "no:$@"), 'yes');
+    ok_case('cert fail attempts', $n, 1);
+}
+
+{
+    package FakeRes;
+    sub new { my ($c, $code) = @_; bless { code => $code }, $c }
+    sub can { return 1 if $_[1] eq 'code' || $_[1] eq 'header'; return }
+    sub code { $_[0]{code} }
+    sub header { return '2' if $_[1] eq 'Retry-After'; return }
+}
+{
+    no warnings 'redefine';
+    local *PVE::Storage::Custom::FlashSystemPlugin::_sleep = sub { };
+    my $n = 0;
+    my $got = PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+        sub { $n++; return FakeRes->new($n < 3 ? 429 : 200); },
+        max_attempts => 3,
+    );
+    ok_case('http 429 retried to 200', ($got && $got->code == 200 ? 'yes' : 'no'), 'yes');
+    ok_case('http 429 attempts', $n, 3);
+}
+
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall auth cases pass\n";
 exit($fail ? 1 : 0);
