@@ -184,8 +184,10 @@ my %TLSWARN;   # addr -> warned about fsinsecure
 
 sub _pwfile {
     my ($storeid) = @_;
-    return undef if !defined $storeid || $storeid !~ /\A[A-Za-z0-9][A-Za-z0-9.\-_]*\z/;
-    return "/etc/pve/priv/storage/$storeid.pw";
+    # The capture is the untaint. $storeid itself stays tainted under perl -T,
+    # and a write open of a tainted path dies with "Insecure dependency".
+    return undef if !defined $storeid || $storeid !~ /\A([A-Za-z0-9][A-Za-z0-9.\-_]*)\z/a;
+    return "/etc/pve/priv/storage/$1.pw";
 }
 
 sub _store_password {
@@ -437,10 +439,16 @@ sub _is_retryable_http {
 
 sub _is_retryable_transport {
     my ($err) = @_;
-    return 0 if !defined $err || !length $err;
+    return 0 if !defined $err;
+    # Section deadlines and status()'s alarm die with an object or the exact
+    # string "timeout". Both must propagate. Retrying them burns the alarm and
+    # then blocks on LWP's own 30s timeout. Check ref before stringifying.
+    return 0 if ref($err);
+    return 0 if !length $err;
+    return 0 if $err =~ /\Atimeout\n?\z/;
     # Certificate failures will not succeed on retry — do not stall pvestatd.
     return 0 if $err =~ /certificate verify failed|self.signed|hostname mismatch|unable to get local issuer/i;
-    return 1 if $err =~ /timed out|timeout|Connection refused|Connection reset|reset by peer|Temporary failure in name resolution|Network is unreachable|Broken pipe/i;
+    return 1 if $err =~ /timed out|Connection refused|Connection reset|reset by peer|Temporary failure in name resolution|Network is unreachable|Broken pipe/i;
     return 0;
 }
 
@@ -715,10 +723,14 @@ sub _flush_device {
 
     my @sd;
     if (-e $map) {
-        my $target = readlink($map);                   # e.g. "../dm-21"
-        my $dm = defined $target ? (split m{/}, $target)[-1] : undef;
+        # readlink is empty when the mapper node is a real device, not a symlink.
+        # _dm_node covers both and returns an untainted dm-N name.
+        my $dm = _dm_node($map);
         if (defined $dm && -d "$SYSFS_BLOCK/$dm/slaves") {
             @sd = map { (split m{/}, $_)[-1] } glob "$SYSFS_BLOCK/$dm/slaves/*";
+        } elsif (!defined $dm) {
+            warn "flashsystem: cannot resolve a dm device for $map; "
+                . "SCSI paths were not deleted\n";
         }
     }
 
@@ -931,7 +943,8 @@ sub _resize_host_device {
     my $settled = 0;
 
     while (1) {
-        select(undef, undef, undef, $RESIZE_POLL_INTERVAL);
+        # budget 0 is the activate_volume path: one look, no sleep.
+        select(undef, undef, undef, $RESIZE_POLL_INTERVAL) if $budget > 0;
 
         # The paths carry the array's capacity; the map can only follow them,
         # so resizing it before they have caught up achieves nothing.
@@ -948,6 +961,7 @@ sub _resize_host_device {
                 last;
             }
         }
+        last if $budget == 0;
         last if time() >= $deadline;
 
         if (time() - $last_rescan >= $RESIZE_RESCAN_INTERVAL) {
@@ -1153,6 +1167,19 @@ sub _alloc_create {
         delete $p->{$_} for qw(rsize autoexpand warning);
     }
     _cmd($scfg, 'mkvdisk', undef, $p, storeid => $storeid);
+    my $vg = $scfg->{fsvolumegroup};
+    return if !defined $vg || !length $vg;
+    # mkvdisk has no volumegroup parameter. chvdisk is what places the vdisk
+    # in the PBR/PBHA group the storage was pointed at.
+    eval {
+        _cmd($scfg, 'chvdisk', $aname, { volumegroup => $vg }, storeid => $storeid);
+        1;
+    } or do {
+        my $err = $@;
+        eval { _cmd($scfg, 'rmvdisk', $aname, {}, storeid => $storeid); };
+        die "flashsystem: created '$aname' but could not add it to volume group "
+            . "'$vg' (the volume was removed): $err";
+    };
 }
 
 # Build the mkvdisk parameter set. Factored out so the thin-provisioning
@@ -1215,7 +1242,7 @@ sub free_image {
         # partition cannot always be deleted as a loose vdisk. Fail with the
         # array message plus the volume-group name rather than auto-removing
         # it from the consistency group (that would split replication).
-        if ($err =~ /volume group|volumegroup|replication|CMMVC\d+E/i
+        if ($err =~ /volume group|volumegroup|replication policy/i
             && defined $scfg->{fsvolumegroup} && length $scfg->{fsvolumegroup})
         {
             die "flashsystem: cannot delete '$volname' while it belongs to volume group "
