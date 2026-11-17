@@ -18,24 +18,29 @@ in [CHANGELOG.md](CHANGELOG.md) and the code comments.
 
 ## Status
 
-Validated in production on (upstream SCSI-FC path):
+Supported floor: **Storage Virtualize 9.1** and Proxmox VE 9.2. New volumes
+are created with `mkvolume` only. Firmware older than 9.1 is not a target.
 
 | Component | Version |
 |---|---|
-| IBM Storage Virtualize firmware | 8.7 |
-| Proxmox VE | 9.2 (12-node cluster) |
-| Transport | FC, dual fabric, dm-multipath (8 paths/volume), ALUA |
+| IBM Storage Virtualize firmware | 9.1 or newer (9.2.0 tracked, not hardware-validated) |
+| Proxmox VE | 9.2 |
+| Transport | SCSI-FC (default), or NVMe-oF on FC / TCP / RDMA |
 | Kubernetes | via proxmox-csi (`vm-9999-pvc-<uuid>` volumes) |
+
+The SCSI-FC path was exercised in production on a 12-node PVE 9.2 cluster
+before the floor moved to 9.1: on-demand provisioning, online resize, live
+migration (multipath map handover — no data copy), move-disk, full clone,
+array snapshots including RAM state, delete with array-side cleanup,
+cloud-init disks, and Kubernetes CSI volumes.
 
 **This fork** adds 9.1 JWT/403 handling, `mkvolume` + provisioning-policy
 awareness, NVMe-oF (FC/TCP/RDMA), TLS CA pinning, `rename_volume`, and
-volume-group placement. Those paths are unit-tested; they are **not** yet
-validated on a FlashSystem 7600 / 9.1.3.1. Use a scratch pool first.
-
-Proven operations (SCSI-FC, firmware 8.7): on-demand provisioning, online
-resize, live migration (multipath map handover — no data copy), move-disk,
-full clone, array snapshots including RAM state, delete with array-side
-cleanup, cloud-init disks, Kubernetes CSI volumes.
+volume-group placement. It also tracks Storage Virtualize 9.2.0 (LTS): no
+replay of `expandvdisksize` after a lost response, `lsvolume` when a pool
+field is `many`, and snapshot name/UUID for a partition management IP.
+Those paths are unit-tested; they are **not** yet validated on a
+FlashSystem 7600 / 9.1.3.1 or on 9.2.0. Use a scratch pool first.
 
 **Not supported:** templates / linked clones (no base-image support — keep
 template VMs on LVM or dir storage; full clones *onto* this storage work),
@@ -53,9 +58,9 @@ error and can therefore look like a working panel with nothing in it.
 
 | Surface | State |
 |---|---|
-| Storage plugin (provision, resize, migrate, clone, snapshot, delete) | Production, 12 nodes, firmware 8.7 |
-| Health API + storage-view tab | Validated on a FlashSystem 5200 / 8.7.0.3 — all five sections returned content and every whitelisted field name matched |
-| Thin provisioning (`fsthin`) | Validated on a **standard** pool (5200 / 8.7.0.3): 100 GiB presented, 5 GiB real, autoexpand confirmed growing on write |
+| Storage plugin (provision, resize, migrate, clone, snapshot, delete) | SCSI-FC exercised in production before the 9.1 floor. 9.1 and 9.2 paths are unit-tested only |
+| Health API + storage-view tab | Field names last checked on a FlashSystem 5200 / 8.7.0.3. Re-check on 9.1+ before trusting an empty section |
+| Thin provisioning (`fsthin`) | Now `mkvolume -thin`. The earlier standard-pool check used the removed `mkvdisk -rsize` shape. Confirm `mkvolume -thin` on a 9.1 scratch pool |
 | Thin provisioning on a **data reduction pool** | **Not validated.** DRPs apply their own rules to space-efficient volumes |
 | Datacenter overview panel | **Unit coverage only** |
 | Performance endpoint (`lsnodestats`, `lssystemstats`, `lsthrottle`, `-history`) | **Unit coverage only** |
@@ -93,7 +98,8 @@ tests/                          unit tests — run anywhere perl exists, no arra
   so it looks fine for months. Scope the user to an ownership group if the
   array is shared.
 - A storage pool (mdiskgrp) to allocate from. Start against a scratch pool.
-- Firmware ≥ 8.5.1 for array snapshots (the Snapshot function, not FlashCopy).
+- Storage Virtualize **9.1 or newer**. Snapshots use the Snapshot function
+  (`addsnapshot`), not FlashCopy.
 
 **Node side** (every node):
 
@@ -125,7 +131,9 @@ tests/                          unit tests — run anywhere perl exists, no arra
   be mapped to SCSI and NVMe at the same time.
 - NVMe/TCP or RDMA: set `fsnvmeaddr` to the array data IPs (port 4420 unless
   you change `fsnvmeport`). Persist discovery with `/etc/nvme/discovery.conf`
-  + `nvmf-autoconnect.service` so reconnect survives reboot.
+  + `nvmf-autoconnect.service` so reconnect survives reboot. On 9.2.0,
+  NVMe/RDMA host attach may use jumbo frames (MTU 9000) on the host and the
+  switch. The plugin does not set that.
 - NVMe/FC: zone host WWPNs to the array's **NVMe** FC ports (not the SCSI
   ones). Some HBAs auto-connect; otherwise put `nn-0xWWNN:pn-0xWWPN` pairs in
   `fsnvmeaddr`.
@@ -207,13 +215,12 @@ exactly.
 | `fspassword` | no | REST password — prefer the `.pw` file |
 | `fshostgroup` | no | host cluster on the array |
 | `fsiogrp` | no | I/O group for new volumes (default `io_grp0`) |
-| `fssnapshots` | no | enable array snapshots (firmware ≥ 8.5.1) |
-| `fsthin` | no | thin-provision **new** volumes (`mkvolume -thin`, or `mkvdisk -rsize` if `fscreate=mkvdisk`). Ignored when the pool already has a provisioning policy. |
+| `fssnapshots` | no | enable array snapshots (Snapshot function; 9.1+) |
+| `fsthin` | no | thin-provision **new** volumes (`mkvolume -thin`). Ignored when the pool already has a provisioning policy. |
 | `fstransport` | yes | `scsi-fc` (default), `nvme-fc`, `nvme-tcp`, `nvme-rdma` |
 | `fsnvmeaddr` | no | NVMe-oF discovery addresses (comma-separated). TCP/RDMA: IPs. FC: `nn-0xWWNN:pn-0xWWPN`. |
 | `fsnvmeport` | no | NVMe/TCP or NVMe/RDMA port (default `4420`) |
 | `fsnvmesubnqn` | no | optional subsystem NQN; empty = `nvme connect-all` discovers it |
-| `fscreate` | no | `mkvolume` (default, 9.x) or `mkvdisk` (8.7-compatible) |
 | `fsvolumegroup` | no | existing array volume group for new volumes (PBR/PBHA awareness) |
 | `fscafile` | no | PEM CA bundle for the management endpoint. Unset = verify against the host trust store. |
 | `fsinsecure` | no | disable TLS certificate verification (self-signed lab arrays only; logs a one-time warning) |
@@ -245,18 +252,15 @@ or touch anything outside their own prefix. Rules that follow:
 
 ### Thin provisioning (`fsthin`)
 
-New volumes are created with **`mkvolume`** by default (9.x). Bare create
-without `fsthin` is fully allocated. `fsthin 1` adds `mkvolume -thin`; if
-you set `fscreate=mkvdisk` it uses the 8.7 shape
-(`-rsize 2% -autoexpand -warning 80%`) instead. When the pool already has a
-provisioning policy, per-volume thin flags are omitted — the policy wins.
+New volumes are created with **`mkvolume`**. Bare create without `fsthin`
+is fully allocated. `fsthin 1` adds `mkvolume -thin`. When the pool already
+has a provisioning policy, `-thin` is omitted — the policy wins. A
+`storage.cfg` line `fscreate mkvolume` is ignored. Any other `fscreate`
+value is rejected; delete the line.
 
-Validated on a standard pool (FlashSystem 5200, firmware 8.7.0.3): a 100 GiB
-volume created with 5 GiB real capacity, reported as *Thin-provisioned* at an
-80% warning threshold, with real capacity growing ahead of the data on write.
-**Not yet validated on a data reduction pool** — DRPs apply their own rules
-to space-efficient volumes, so test on a scratch DRP first if that is where
-you intend to use it.
+`mkvolume -thin` is not yet hardware-validated on 9.1. **Not yet validated
+on a data reduction pool** — DRPs apply their own rules to space-efficient
+volumes, so test on a scratch pool first.
 
 Thin means **overcommit**: a pool driven to physical-full takes every volume
 in it offline. Have array-side physical-free alerting in place before
@@ -271,8 +275,12 @@ allocation; convert online array-side with `addvdiskcopy -autodelete`.
   physical-full. `status()` prefers `physical_capacity`/`physical_free_capacity`
   when present, so the PVE usage bar matches the array GUI's "Usable" figures.
 - **REST throttling is handled.** The array rate-limits its API (HTTP 429);
-  the plugin retries with backoff (honoring sane `Retry-After`) and caches
-  pool status per (array, pool) within each pvestatd cycle, so storages
+  the plugin retries that with backoff (honoring sane `Retry-After`). A lost
+  response on `expandvdisksize`, `mkvolume`, `rmvdisk`, or a snapshot
+  command is **not** retried: those commands can commit before the HTTP
+  client sees the failure, and a second `expandvdisksize` grows the volume
+  again. Reads still retry transport errors. Pool status is cached
+  per (array, pool) within each pvestatd cycle, so storages
   sharing a pool cost one query and a down array is probed once per cycle,
   not once per storage. `status()` is also hard-bounded — a slow array
   reports inactive instead of stalling pvestatd. The datacenter overview
@@ -285,13 +293,17 @@ allocation; convert online array-side with `addvdiskcopy -autodelete`.
   purpose (tolerating it would orphan volumes); automation should treat these
   as retryable, and humans should just wait. Do not disable volume protection
   to avoid the wait.
-- **Snapshots** use the Snapshot function (`addsnapshot`); loose-volume
-  snapshots must be removed/restored by **snapshot ID** (a bare name draws
-  `CMMVC5707E`). A RAM-state snapshot creates an extra volume sized to guest
-  RAM in the same pool. Re-activation mapping conflicts (`CMMVC9066E`) are
-  treated as success.
+- **Snapshots** use the Snapshot function (`addsnapshot`), not FlashCopy.
+  9.2 is the last release that still includes legacy FlashCopy. Loose-volume
+  rollback/delete send a snapshot UUID when the array returns one, otherwise
+  the numeric snapshot id (a bare name draws `CMMVC5707E`). The
+  volume is named, not passed as a short id, so a partition management IP
+  can accept the call. A volume that already belongs to a volume group is
+  not snapshotted by snapshotting that whole group. A RAM-state snapshot
+  creates an extra volume sized to guest RAM in the same pool.
+  Re-activation mapping conflicts (`CMMVC9066E`) are treated as success.
 - **List commands take `-bytes`** (JSON `true`), not `-unit` — `-unit b`
-  belongs to `mkvdisk`/`expandvdisksize` only, and `expandvdisksize` takes
+  belongs to `mkvolume`/`expandvdisksize` only, and `expandvdisksize` takes
   the **delta**, not an absolute size.
 
 ## Testing
@@ -312,23 +324,21 @@ its fields, never report zeros). No array needed.
 
 ## Security notes
 
-- **TLS verification is currently disabled** for the array's management
-  endpoint (self-signed certificates are the norm there). Pinning a CA is on
-  the roadmap; treat the management VLAN as trusted until then, or patch
-  `ssl_opts` for your CA before production.
+- **TLS verification is on** for the management endpoint. A private CA is
+  pinned with `fscafile`. A self-signed lab array sets `fsinsecure=1` (one
+  warning). Certificate failures are not retried. See `SECURITY.md`.
 - The REST user can do anything its role allows on the array — the plugin's
   prefix discipline is enforcement in code, not in the account. Use ownership
   groups where tenancy matters.
 
 ## Open questions (for IBM collaboration)
 
-1. **DRP deprecation**: with data reduction pools being phased out, what is
-   the recommended allocation guidance for new deployments — and does that
-   change the preferred thin mechanism (`mkvdisk -rsize` vs `mkvolume`)?
-2. **9.x capacity fields**: capacity reporting reportedly changes in 9.x —
-   which `lsmdiskgrp` fields should `status()` prefer there, and do the
-   `physical_*` fields survive?
-3. **REST improvements since 8.7**: documented rate limits, token lifetimes,
+1. **DRP deprecation**: with data reduction pools being phased out, what
+   allocation guidance should new 9.1+ deployments follow? Create is
+   `mkvolume` only.
+2. **9.1 / 9.2 capacity fields**: which `lsmdiskgrp` fields should
+   `status()` prefer, and do the `physical_*` fields survive on 9.2?
+3. **REST on 9.1 and 9.2**: documented rate limits, token lifetimes,
    batching, or keep-alive guidance we should adopt instead of the current
    empirical backoff?
 4. **Object-name limits**: is 63 chars the documented cap for volume and

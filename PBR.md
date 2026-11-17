@@ -26,6 +26,34 @@ Operator work still done on the array (or Ansible):
 
 Then point the Proxmox storage at that group.
 
+## 9.2.0, still awareness only
+
+9.2.0 (LTS) adds synchronous DR **outside** a partition (FC or high-speed
+Ethernet, not TCP/IP; a partnership is DR or HA, not both) and lets one HA
+partition add a synchronous copy to a third site. Promote is unchanged:
+`chvolumegroupreplication -mode independent` on the recovery system, then
+map hosts. The plugin still does not run that.
+
+What the plugin does do on 9.2:
+
+- `list_images` and the health list use `lsvolume` when the array has it,
+  so a volume whose `lsvdisk` pool is `many` is not dropped.
+- Snapshot create/rollback/delete send a volume **name** and a snapshot
+  **UUID** when the row has one. A partition management IP rejects short
+  ids. Point `fsaddress` at the partition IP only after the management
+  certificate matches that name (SNI); `fscafile` pins the CA.
+- A Proxmox snapshot of one disk does **not** become
+  `addsnapshot -volumegroup` of `fsvolumegroup`. That would snapshot every
+  VM in the group. HA snapshots are volume-group scoped; use one group per
+  VM (`slice A`) before expecting `fssnapshots` to succeed there.
+- Creating into a group that has a snapshot buffer is still just
+  `mkvolume -volumegroup`. The array creates the buffer objects. If that
+  buffer is busy, the new volume is missing from the snapshot already in
+  progress. The plugin does not probe buffer status.
+
+NVMe/RDMA host attach on 9.2 may use MTU 9000. That is set on the host and
+the switch, not in this plugin.
+
 ## Full PBR from Proxmox — estimate
 
 | Slice | Scope | Effort |

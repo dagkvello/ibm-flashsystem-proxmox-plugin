@@ -11,7 +11,7 @@
 # could round-trip through list_images as a phantom volume.
 #
 # The length gate exists because Storage Virtualize caps object names at 63
-# and mkvdisk past the cap fails with an opaque CMMVC error. The boundary
+# and the create command past the cap fails with an opaque CMMVC error. The boundary
 # case is real: fsprefix 'pvecl1_Archive' (15 with separator) + the CSI
 # name shape vm-9999-pvc-<36-char-uuid> (48) = exactly 63.
 #
@@ -113,31 +113,6 @@ ok_case('alloc vmid mismatch dies', ($@ && $@ =~ /illegal name/) ? 'illegal-name
 # Non-raw formats are still refused.
 eval { $P->alloc_image('Archive', $scfg, 101, 'qcow2', 'vm-101-disk-0', 1024) };
 ok_case('alloc qcow2 dies', ($@ && $@ =~ /only raw/) ? 'raw-only error' : "(!? $@)", 'raw-only error');
-
-# ---- _mkvdisk_params: the thin-provisioning shape (fsthin) -----------------
-# Bare mkvdisk = fully allocated (confirmed live 2026-08-25). fsthin adds
-# rsize/autoexpand/warning; nothing else about the call may change.
-use JSON ();
-my $MK = \&PVE::Storage::Custom::FlashSystemPlugin::_mkvdisk_params;
-my $thick = $MK->({ fspool => 'P' }, 'x-vm-1-disk-0', 1048576);
-ok_case('thick: no rsize',        (exists $thick->{rsize} ? 'rsize' : 'none'), 'none');
-ok_case('thick: no autoexpand',   (exists $thick->{autoexpand} ? 'yes' : 'none'), 'none');
-ok_case('thick: no warning',      (exists $thick->{warning} ? 'yes' : 'none'), 'none');
-ok_case('thick: size in bytes',   $thick->{size}, 1048576);
-ok_case('thick: iogrp default',   $thick->{iogrp}, 'io_grp0');
-my $thin = $MK->({ fspool => 'P', fsthin => 1, fsiogrp => 'io_grp1' }, 'x-vm-1-disk-0', 1048576);
-ok_case('thin: rsize 2%',         $thin->{rsize}, '2%');
-ok_case('thin: warning 80%',      $thin->{warning}, '80%');
-# Must be a JSON boolean, not a plain 1: the array's valueless CLI flags are
-# encoded as JSON true (the -bytes precedent) — "autoexpand":1 is a different
-# request body than "autoexpand":true.
-ok_case('thin: autoexpand JSON bool',
-    (JSON::is_bool($thin->{autoexpand}) && $thin->{autoexpand}) ? 'true' : 'not-a-json-bool',
-    'true');
-ok_case('thin: size unchanged',   $thin->{size}, 1048576);
-ok_case('thin: pool unchanged',   $thin->{mdiskgrp}, 'P');
-ok_case('thin: iogrp override',   $thin->{iogrp}, 'io_grp1');
-ok_case('thin: name unchanged',   $thin->{name}, 'x-vm-1-disk-0');
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall cases pass\n";
 exit($fail ? 1 : 0);

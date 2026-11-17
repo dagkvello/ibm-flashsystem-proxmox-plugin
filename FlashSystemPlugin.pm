@@ -11,7 +11,7 @@ package PVE::Storage::Custom::FlashSystemPlugin;
 #   - list commands (lsvdisk/lsmdiskgrp) report exact byte counts with the
 #     valueless `-bytes` flag, encoded as JSON boolean: `{ bytes => JSON::true }`.
 #     (`-unit b` is NOT accepted here — it only applies to the size-taking
-#     commands mkvdisk/expandvdisksize.)
+#     commands mkvolume/expandvdisksize.)
 #   - `expandvdisksize` takes the DELTA to add, not an absolute size.
 #
 # Volumes are raw block devices, named `vm-<vmid>-disk-<N>` (Proxmox convention).
@@ -25,9 +25,11 @@ package PVE::Storage::Custom::FlashSystemPlugin;
 # multipath map on deactivate. NVMe-oF leaves the fabric session up (a
 # disconnect is subsystem-wide and would drop every volume on the array).
 #
-# STATUS: SCSI-FC path is production-validated on firmware 8.7 / PVE 9.2.
-# 9.1.3.1 + NVMe-oF + mkvolume/policy path: VALIDATE on a scratch pool
-# before production. Search this file for "VALIDATE:".
+# STATUS: supported floor is Storage Virtualize 9.1, PVE 9.2. Create is
+# mkvolume only. SCSI-FC was production-validated before that floor moved.
+# 9.1.3.1 + NVMe-oF + provisioning policy, and the 9.2.0 lsvolume /
+# snapshot-UUID path: VALIDATE on a scratch pool before production.
+# Search this file for "VALIDATE:".
 # ---------------------------------------------------------------------------
 
 use strict;
@@ -113,7 +115,7 @@ sub properties {
         fsiogrp   => { description => 'I/O group for new vdisks (default io_grp0)', type => 'string' },
         fssnapshots => { description => 'Enable array snapshots (validate firmware first)', type => 'boolean' },
         fsprefix  => { description => 'Prefix for array-side object names, e.g. the cluster name. Required when several clusters share a pool.', type => 'string' },
-        fsthin    => { description => 'Thin-provision new volumes. Uses mkvolume -thin (or mkvdisk -rsize if fscreate=mkvdisk). Ignored when the pool already has a provisioning policy.', type => 'boolean' },
+        fsthin    => { description => 'Thin-provision new volumes (mkvolume -thin). Ignored when the pool already has a provisioning policy.', type => 'boolean' },
         fstransport => {
             description => 'Host transport: scsi-fc (default), nvme-fc, nvme-tcp, nvme-rdma',
             type => 'string',
@@ -139,7 +141,7 @@ sub properties {
             type => 'boolean',
         },
         fscreate => {
-            description => 'Volume create command: mkvolume (default, 9.x + provisioning policies) or mkvdisk (8.7-compatible).',
+            description => 'Obsolete. Leave unset. Storage Virtualize 9.1 and newer create volumes with mkvolume. Any other value is rejected. Remove this from storage.cfg.',
             type => 'string',
         },
         fsvolumegroup => {
@@ -181,6 +183,8 @@ my %UA;        # "$addr|$cafile|$insecure" -> LWP::UserAgent
 my %TOKENS;    # "$addr|$user"             -> { token => ..., exp => unix|undef }
 my %PWWARN;    # storeid -> warned about plaintext fspassword
 my %TLSWARN;   # addr -> warned about fsinsecure
+our %LSVOLUME_UNSUPPORTED;  # addr -> lsvolume probe failed; stay on lsvdisk
+my %LSVOLUME_WARN;          # addr -> already warned about a non-obvious probe failure
 
 sub _pwfile {
     my ($storeid) = @_;
@@ -319,13 +323,18 @@ sub _decode_json_checked {
 }
 
 # Bounded HTTP retry. $max_attempts is the total number of $cb invocations
-# for 429/5xx/transport errors (default 3 => at most 1+2+4s extra sleep,
-# which still fits under status()'s 10s alarm). A single 401/403 re-auth
-# is extra and does not consume a 429 slot.
+# for retryable failures (default 3 => at most 1+2+4s extra sleep, which
+# still fits under status()'s 10s alarm). A single 401/403 re-auth is extra
+# and does not consume a 429 slot.
+#
+# idempotent defaults to true (reads, auth). Mutations pass 0: a 429 is
+# rejected before the CLI runs and is safe to repeat, but a lost response
+# after expandvdisksize was accepted would add the same delta again.
 sub _request_with_retry {
     my ($cb, %opt) = @_;
     my $max = $opt{max_attempts} // 3;
     $max = 1 if $max < 1;
+    my $idempotent = $opt{idempotent} // 1;
     my $reauthed = 0;
     my $attempt = 0;
     my $res;
@@ -333,7 +342,7 @@ sub _request_with_retry {
         $attempt++;
         eval { $res = $cb->(); 1 } or do {
             my $err = $@;
-            die $err if !_is_retryable_transport($err) || $attempt >= $max;
+            die $err if !$idempotent || !_is_retryable_transport($err) || $attempt >= $max;
             _sleep(_retry_delay(undef, $attempt - 1));
             next;
         };
@@ -347,7 +356,7 @@ sub _request_with_retry {
             $attempt--;
             next;
         }
-        last if !_is_retryable_http($res) || $attempt >= $max;
+        last if !_is_retryable_http($res, $idempotent) || $attempt >= $max;
         _sleep(_retry_delay($res, $attempt - 1));
     }
     return $res;
@@ -400,12 +409,16 @@ sub _cmd {
         return _ua($scfg)->request($req);
     };
 
+    # ls* reads can be repeated. Everything else this plugin sends can
+    # commit before the HTTP response is lost (expandvdisksize is a delta).
+    my $idempotent = (defined $command && $command =~ /\Als/) ? 1 : 0;
     my $res = _request_with_retry(
         sub {
             my $token = _auth($scfg, $opt{storeid});
             return $send->($token);
         },
         max_attempts => 3,
+        idempotent => $idempotent,
         on_unauthorized => sub {
             delete $TOKENS{ _tokkey($scfg) };
         },
@@ -429,11 +442,36 @@ sub _one {
     return $data;
 }
 
-sub _is_retryable_http {
+sub _http_body {
+    my ($res) = @_;
+    return '' if !defined $res || !$res->can('decoded_content');
+    my $body = eval { $res->decoded_content };
+    return defined $body ? $body : '';
+}
+
+# LWP's default use_eval turns a die inside the request — status()'s alarm
+# string "timeout", or a certificate failure — into a synthetic HTTP 500
+# before this plugin's transport classifier sees it. Those must not be retried.
+sub _is_terminal_http {
     my ($res) = @_;
     return 0 if !defined $res;
+    my $body = _http_body($res);
+    my $line = $res->can('status_line') ? (eval { $res->status_line } // '') : '';
+    my $blob = "$line\n$body";
+    return 1 if $blob =~ /certificate verify failed|self[- ]signed certificate|hostname mismatch|unable to get local issuer/i;
+    return 1 if $body =~ /\Atimeout\n?\z/a;
+    return 0;
+}
+
+sub _is_retryable_http {
+    my ($res, $idempotent) = @_;
+    $idempotent = 1 if !defined $idempotent;
+    return 0 if !defined $res;
+    return 0 if _is_terminal_http($res);
     my $code = $res->code || 0;
-    return 1 if $code == 408 || $code == 429 || ($code >= 500 && $code <= 599);
+    return 1 if $code == 429;
+    return 0 if !$idempotent;
+    return 1 if $code == 408 || ($code >= 500 && $code <= 599);
     return 0;
 }
 
@@ -1089,7 +1127,7 @@ sub alloc_image {
 
     # Storage Virtualize caps object names at 63 characters, and the fsprefix,
     # the volname and (later) a ".<snapshot>" suffix all share that budget.
-    # Enforce the hard cap here, where the error is actionable — mkvdisk would
+    # Enforce the hard cap here, where the error is actionable — mkvolume would
     # only fail with an opaque CMMVC error. Snapshot headroom is deliberately
     # NOT reserved: state and pvc volumes near the cap are still usable disks;
     # _snap_name enforces its own limit per snapshot attempt.
@@ -1138,88 +1176,32 @@ sub _mkvolume_params {
     return $p;
 }
 
-sub _create_cmd {
+# A leftover fscreate line must not select a pre-9.1 create command.
+# Empty or mkvolume is accepted so an existing storage.cfg still loads.
+# Anything else dies here, before REST.
+sub _reject_legacy_create {
     my ($scfg) = @_;
-    my $c = lc($scfg->{fscreate} // 'mkvolume');
+    my $c = $scfg->{fscreate} // '';
     $c =~ s/^\s+|\s+$//g;
-    return 'mkvdisk' if $c eq 'mkvdisk';
-    return 'mkvolume';
+    return if $c eq '' || lc($c) eq 'mkvolume';
+    die "flashsystem: fscreate '$c' is not supported. "
+        . "Storage Virtualize 9.1 and newer create volumes with mkvolume. "
+        . "Remove fscreate from this storage.\n";
 }
 
-# Probe the pool once (cached on $scfg for the call) so a policy-backed
-# pool does not get -thin/-rsize which 9.x rejects.
+# Probe the pool once so a policy-backed pool does not get -thin, which
+# 9.1+ rejects when a provisioning policy is set.
 sub _alloc_create {
     my ($scfg, $aname, $bytes, $storeid) = @_;
-    my $cmd = _create_cmd($scfg);
+    _reject_legacy_create($scfg);
     my $has_policy = 0;
     my $g = eval {
         _one(_cmd($scfg, 'lsmdiskgrp', $scfg->{fspool}, { bytes => JSON::true }, storeid => $storeid));
     };
     $has_policy = _pool_has_policy($g) if $g;
 
-    if ($cmd eq 'mkvolume') {
-        _cmd($scfg, 'mkvolume', undef, _mkvolume_params($scfg, $aname, $bytes, $has_policy),
-            storeid => $storeid);
-        return;
-    }
-    my $p = _mkvdisk_params($scfg, $aname, $bytes);
-    if ($has_policy) {
-        delete $p->{$_} for qw(rsize autoexpand warning);
-    }
-    _cmd($scfg, 'mkvdisk', undef, $p, storeid => $storeid);
-    my $vg = $scfg->{fsvolumegroup};
-    return if !defined $vg || !length $vg;
-    # mkvdisk has no volumegroup parameter. chvdisk is what places the vdisk
-    # in the PBR/PBHA group the storage was pointed at.
-    eval {
-        _cmd($scfg, 'chvdisk', $aname, { volumegroup => $vg }, storeid => $storeid);
-        1;
-    } or do {
-        my $err = $@;
-        eval { _cmd($scfg, 'rmvdisk', $aname, {}, storeid => $storeid); };
-        die "flashsystem: created '$aname' but could not add it to volume group "
-            . "'$vg' (the volume was removed): $err";
-    };
-}
-
-# Build the mkvdisk parameter set. Factored out so the thin-provisioning
-# shape is unit-testable without an array (tests/t_names.pl).
-#
-# LOCAL PATCH (see UPSTREAM.md): optional thin provisioning via `fsthin`.
-# Bare mkvdisk creates FULLY ALLOCATED volumes — the full provisioned size is
-# reserved in the pool at creation (confirmed live 2026-08-25), which also
-# bypasses a data reduction pool's thin/dedup layer. `mkvdisk -rsize` is used
-# rather than the newer mkvolume because it behaves the same on standard
-# pools and DRPs — relevant since IBM is moving away from DRPs.
-# Validated 2026-08-26 on a STANDARD pool (FlashSystem 5200, firmware
-# 8.7.0.3): mkvdisk accepted rsize '2%', autoexpand as a JSON boolean and
-# warning '80%'. A 100 GiB volume was created with 5 GiB real capacity, the
-# array reported "Capacity savings: Thin-provisioned" at an 80% warning
-# threshold, and real capacity grew ahead of the data on write — autoexpand
-# confirmed working.
-#
-# VALIDATE: data reduction pools apply their own rules to space-efficient
-# volumes and were NOT covered by that test. Confirm on a scratch DRP before
-# enabling fsthin on one. (IBM is moving away from DRPs, so the standard-pool
-# path above is the strategically relevant one.)
-# VALIDATE: thin means overcommit — have array-side physical-free alerting in
-# place before enabling on pools shared with other workloads, and note IBM's
-# hint that capacity reporting changes in 9.x firmware.
-sub _mkvdisk_params {
-    my ($scfg, $aname, $bytes) = @_;
-    my $p = {
-        name     => $aname,
-        mdiskgrp => $scfg->{fspool},
-        iogrp    => ($scfg->{fsiogrp} // 'io_grp0'),
-        size     => $bytes,
-        unit     => 'b',
-    };
-    if ($scfg->{fsthin}) {
-        $p->{rsize}      = '2%';        # real capacity reserved up front
-        $p->{autoexpand} = JSON::true;  # grow real capacity on demand
-        $p->{warning}    = '80%';       # array event at 80% of virtual size
-    }
-    return $p;
+    _cmd($scfg, 'mkvolume', undef, _mkvolume_params($scfg, $aname, $bytes, $has_policy),
+        storeid => $storeid);
 }
 
 sub free_image {
@@ -1255,13 +1237,117 @@ sub free_image {
     return undef;
 }
 
+# lsvolume is 9.2. A missing command is not an outage: remember it and
+# keep using lsvdisk. Auth, throttle, and transport failures still propagate.
+sub _command_unsupported {
+    my ($err) = @_;
+    return 0 if !defined $err;
+    return 1 if $err =~ /404 Not Found/;
+    return 1 if $err =~ /CMMVC7205E/;
+    return 1 if $err =~ /unknown command/i;
+    return 1 if $err =~ /command (?:specified |sent )?is not (?:recognized|valid)/i;
+    return 1 if $err =~ /Command not found/i;
+    return 1 if $err =~ /not a valid command/i;
+    return 0;
+}
+
+sub _probe_must_propagate {
+    my ($err) = @_;
+    return 0 if !defined $err;
+    return 1 if $err =~ /certificate verify failed|self[- ]signed|hostname mismatch|unable to get local issuer/i;
+    return 1 if $err =~ /\b(401|403|408|429|500|502|503|504)\b/;
+    return 1 if $err =~ /timed out|Connection refused|Connection reset|Network is unreachable|no REST password|auth failed/i;
+    return 1 if $err =~ /\Atimeout\n?\z/a;
+    return 0;
+}
+
+# Normalise one lsvolume row onto the lsvdisk fields list_images and the
+# health panel already read. size is the host-visible capacity.
+sub _lsvolume_as_vdisk {
+    my ($v) = @_;
+    return undef if ref($v) ne 'HASH';
+    my %c = %$v;
+    $c{capacity} = $c{size} if !defined $c{capacity} && defined $c{size};
+    $c{mdisk_grp_name} = $c{local_pool_name}
+        if !defined $c{mdisk_grp_name} && defined $c{local_pool_name};
+    return \%c;
+}
+
+# undef means "this array has no lsvolume" (cached). An arrayref, possibly
+# empty, means the command ran. Other failures die.
+sub _lsvolume_rows {
+    my ($scfg, $storeid, $pool) = @_;
+    my $addr = $scfg->{fsaddress} // '';
+    return undef if $LSVOLUME_UNSUPPORTED{$addr};
+    my $rows = eval {
+        _cmd($scfg, 'lsvolume', undef, {
+            filtervalue => "local_pool_name=$pool",
+            bytes => JSON::true,
+        }, storeid => $storeid);
+    };
+    my $err = $@;
+    if ($err) {
+        die $err if !_command_unsupported($err) && _probe_must_propagate($err);
+        if (!_command_unsupported($err) && !$LSVOLUME_WARN{$addr}++) {
+            chomp $err;
+            warn "flashsystem: lsvolume failed, using lsvdisk: $err\n";
+        }
+        $LSVOLUME_UNSUPPORTED{$addr} = 1;
+        return undef;
+    }
+    $rows = [] if !defined $rows;
+    $rows = [ $rows ] if ref($rows) eq 'HASH';
+    die "flashsystem: lsvolume returned an unexpected payload\n"
+        if ref($rows) ne 'ARRAY';
+    my @out;
+    for my $v (@$rows) {
+        my $c = _lsvolume_as_vdisk($v);
+        push @out, $c if $c;
+    }
+    return \@out;
+}
+
+sub _lsvdisk_pool {
+    my ($scfg, $storeid, $pool) = @_;
+    return _cmd($scfg, 'lsvdisk', undef, {
+        filtervalue => "mdisk_grp_name=$pool",
+        bytes => JSON::true,
+    }, storeid => $storeid) // [];
+}
+
+# Pool membership. lsvdisk's server-side mdisk_grp_name filter drops mirrored
+# and some HA volumes because that field is "many". 9.2 lsvolume keeps
+# local_pool_name. rich=1 keeps the lsvdisk rows (fast_write_state,
+# se_copy_count) and appends volumes only lsvolume could see.
+# lsvolume => \$slot records the lsvolume rows for the DRP fill path so the
+# health call does not issue the command twice.
+sub _list_pool_volumes {
+    my ($scfg, $storeid, $pool, %opt) = @_;
+    $pool //= $scfg->{fspool};
+    my $lsvol = _lsvolume_rows($scfg, $storeid, $pool);
+    ${ $opt{lsvolume} } = $lsvol if ref($opt{lsvolume}) eq 'SCALAR';
+
+    if (!$opt{rich}) {
+        return $lsvol if defined $lsvol && @$lsvol;
+        return _lsvdisk_pool($scfg, $storeid, $pool);
+    }
+
+    my $legacy = _lsvdisk_pool($scfg, $storeid, $pool);
+    $legacy = [] if ref($legacy) ne 'ARRAY';
+    return $legacy if !defined $lsvol || !@$lsvol;
+    my %have = map { +( ($_->{name} // '') => 1 ) } @$legacy;
+    for my $v (@$lsvol) {
+        next if ref($v) ne 'HASH';
+        my $n = $v->{name} // next;
+        push @$legacy, $v if length $n && !$have{$n};
+    }
+    return $legacy;
+}
+
 sub list_images {
     my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
-    my $vdisks = _cmd(
-        $scfg, 'lsvdisk', undef,
-        { filtervalue => "mdisk_grp_name=$scfg->{fspool}", bytes => JSON::true },
-        storeid => $storeid,
-    ) // [];
+    my $vdisks = _list_pool_volumes($scfg, $storeid, $scfg->{fspool});
+    $vdisks = [] if ref($vdisks) ne 'ARRAY';
 
     my $res = [];
     foreach my $v (@$vdisks) {
@@ -1616,13 +1702,14 @@ sub volume_size_info {
 }
 
 # ---- Snapshots (opt-in) --------------------------------------------------
-# Uses the Storage Virtualize "Snapshot" function (addsnapshot / rmsnapshot /
-# restorefromsnapshot), present on ~8.5.1+ (verified live on 8.7). We snapshot
-# a single "loose" volume (no volume group), so rmsnapshot/restorefromsnapshot
-# must identify it by system-wide snapshot ID — passing only the name is
-# rejected (CMMVC5707E). _snapshot_id() resolves name -> ID via lsvolumesnapshot.
-# On older arrays without this function, use FlashCopy instead. Disabled unless
-# the storage is configured with `fssnapshots 1`.
+# Snapshot function (addsnapshot / rmsnapshot / restorefromsnapshot).
+# 9.2 is the last release with legacy FlashCopy; this plugin does not add a
+# FlashCopy path.
+#
+# A loose volume is not in a volume group, so rollback/delete must not send
+# only the snapshot name (CMMVC5707E). The numeric snapshot id works on the
+# system management IP. A 9.2 partition IP rejects short ids, so a UUID on
+# the row is preferred. Disabled unless `fssnapshots 1`.
 
 sub _snap_name {
     my ($volname, $snap) = @_;
@@ -1634,25 +1721,75 @@ sub _snap_name {
     return $n;
 }
 
-# Resolve a loose-volume snapshot's system-wide ID from its (deterministic)
-# name. Returns undef if not present (so delete can be idempotent).
+# UUID when the row has one (a 9.2 partition IP rejects short ids). Otherwise
+# the numeric snapshot id, which loose-volume rollback/delete accept on the
+# system management IP.
+sub _snapshot_ref {
+    my ($row) = @_;
+    return undef if ref($row) ne 'HASH';
+    for my $k (qw(snapshot_uuid uuid)) {
+        my $u = $row->{$k};
+        next if !defined $u || $u eq '' || $u =~ /\A\d+\z/a;
+        return $u;
+    }
+    return $row->{snapshot_id};
+}
+
+sub _volume_group_label {
+    my ($v, $scfg) = @_;
+    return undef if ref($v) ne 'HASH';
+    my $name = $v->{volume_group_name};
+    return $name if defined $name && $name ne '' && lc($name) ne 'none';
+    my $id = $v->{volume_group_id};
+    return undef if !defined $id || $id eq '' || $id eq '0' || lc("$id") eq 'none';
+    return $scfg->{fsvolumegroup}
+        if defined $scfg && defined $scfg->{fsvolumegroup} && length $scfg->{fsvolumegroup};
+    return "id $id";
+}
+
+# Resolve a loose-volume snapshot handle from its deterministic name.
+# Returns undef if not present (so delete can be idempotent).
 sub _snapshot_id {
     my ($scfg, $volname, $snap, $storeid) = @_;
     my $sname = _snap_name(_arrayname($scfg, $volname), $snap);
     my $list = _cmd($scfg, 'lsvolumesnapshot', undef, {}, storeid => $storeid) // [];
+    $list = [ $list ] if ref($list) eq 'HASH';
+    return undef if ref($list) ne 'ARRAY';
     for my $s (@$list) {
-        return $s->{snapshot_id} if ($s->{snapshot_name} // '') eq $sname;
+        next if ref($s) ne 'HASH';
+        next if ($s->{snapshot_name} // '') ne $sname;
+        return _snapshot_ref($s);
     }
     return undef;
+}
+
+sub _snapshot_group_die {
+    my ($volname, $vg, $err) = @_;
+    chomp $err if defined $err;
+    die "flashsystem: snapshot of '$volname' was not taken. "
+        . "The volume is in volume group '$vg'. "
+        . "An HA snapshot is volume-group scoped, and this plugin will not "
+        . "snapshot that shared group because it can contain other VMs. "
+        . "Array said: $err\n";
 }
 
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
     die "flashsystem: snapshots disabled (set 'fssnapshots 1' after validating firmware)\n"
         if !$scfg->{fssnapshots};
-    my $id = _vdisk($scfg, $volname, $storeid)->{id};
-    _cmd($scfg, 'addsnapshot', undef,
-        { name => _snap_name(_arrayname($scfg, $volname), $snap), volumes => $id }, storeid => $storeid);
+    my $v = _vdisk($scfg, $volname, $storeid);
+    my $vg = _volume_group_label($v, $scfg);
+    eval {
+        _cmd($scfg, 'addsnapshot', undef, {
+            name => _snap_name(_arrayname($scfg, $volname), $snap),
+            volumes => $v->{name},
+        }, storeid => $storeid);
+        1;
+    } or do {
+        my $err = $@;
+        _snapshot_group_die($volname, $vg, $err) if defined $vg && length $vg;
+        die $err;
+    };
     return undef;
 }
 
@@ -1661,9 +1798,17 @@ sub volume_snapshot_rollback {
     die "flashsystem: snapshots disabled\n" if !$scfg->{fssnapshots};
     my $sid = _snapshot_id($scfg, $volname, $snap, $storeid);
     die "flashsystem: snapshot '$snap' for '$volname' not found\n" if !defined $sid;
-    my $vid = _vdisk($scfg, $volname, $storeid)->{id};
-    _cmd($scfg, 'restorefromsnapshot', undef,
-        { snapshotid => $sid, volumes => $vid }, storeid => $storeid);
+    my $v = _vdisk($scfg, $volname, $storeid);
+    my $vg = _volume_group_label($v, $scfg);
+    eval {
+        _cmd($scfg, 'restorefromsnapshot', undef,
+            { snapshotid => $sid, volumes => $v->{name} }, storeid => $storeid);
+        1;
+    } or do {
+        my $err = $@;
+        _snapshot_group_die($volname, $vg, $err) if defined $vg && length $vg;
+        die $err;
+    };
     return undef;
 }
 
@@ -1672,7 +1817,16 @@ sub volume_snapshot_delete {
     die "flashsystem: snapshots disabled\n" if !$scfg->{fssnapshots};
     my $sid = _snapshot_id($scfg, $volname, $snap, $storeid);
     return undef if !defined $sid;    # already gone -> idempotent
-    _cmd($scfg, 'rmsnapshot', undef, { snapshotid => $sid }, storeid => $storeid);
+    eval {
+        _cmd($scfg, 'rmsnapshot', undef, { snapshotid => $sid }, storeid => $storeid);
+        1;
+    } or do {
+        my $err = $@;
+        my $v = eval { _vdisk($scfg, $volname, $storeid) };
+        my $vg = _volume_group_label($v, $scfg);
+        _snapshot_group_die($volname, $vg, $err) if defined $vg && length $vg;
+        die $err;
+    };
     return undef;
 }
 

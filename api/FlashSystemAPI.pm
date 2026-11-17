@@ -257,8 +257,8 @@ sub _fsone { return PVE::Storage::Custom::FlashSystemPlugin::_one(@_); }
 # Whitelisted like every other section: a firmware that adds or drops a
 # statistic degrades to a missing row, never an error. compression_cpu_pc,
 # power_w and temp_c are NOT in the 8.1.3 reference and are listed
-# speculatively for newer firmware — they simply will not appear on 8.7 if
-# the array does not report them.
+# speculatively for newer firmware — they simply will not appear when the
+# array does not report them.
 our @STAT_NAMES = qw(
     cpu_pc compression_cpu_pc write_cache_pc total_cache_pc
     vdisk_io vdisk_mb vdisk_ms
@@ -633,7 +633,7 @@ sub _sev_fill_view {
 #                     the pool is the real constraint.
 #   autoexpand off -> used / real_capacity. There is no growth, and reaching
 #                     100% takes the volume OFFLINE.
-# This mirrors IBM's own -warning semantics on mkvdisk/addvdiskcopy.
+# This mirrors IBM's volume -warning semantics (autoexpand on vs off).
 sub _apply_fill {
     my ($vols, $map) = @_;
     my $by = ($map && $map->{by_name}) || {};
@@ -662,17 +662,41 @@ sub _apply_fill {
 # Returns the {available, reason} block the panel renders instead of a bar
 # when fill is not knowable - a zero-width bar next to real capacity reads as
 # "empty", which is exactly the wrong conclusion.
+sub _lsvolume_fill_view {
+    my ($rows) = @_;
+    $rows = [] if ref($rows) ne 'ARRAY';
+    my $by_name = {};
+    my $usable = 0;
+    for my $r (@$rows) {
+        next if ref($r) ne 'HASH';
+        my $n = $r->{name};
+        next if !defined $n || !length $n;
+        my $used = _num($r->{physical_used});
+        next if !defined $used;
+        $usable++;
+        # autoexpand 'on' makes _apply_fill divide by the host-visible size.
+        # physical_used / provisioned is the DRP fill lssevdiskcopy cannot give.
+        $by_name->{$n} = { used => $used, autoexpand => 'on' };
+    }
+    return { by_name => $by_name, copies => scalar(@$rows), usable => $usable };
+}
+
 sub _collect_fill {
-    my ($scfg, $storeid, $pool, $poolinfo, $vols, $errors, $deadline) = @_;
+    my ($scfg, $storeid, $pool, $poolinfo, $vols, $errors, $deadline, $lsvol) = @_;
 
     if (!$poolinfo) {
         return { available => 0, reason => 'pool-capacity-unavailable' };
     }
-    # IBM, per field: used_capacity / real_capacity / free_capacity are BLANK
-    # for thin and compressed copies in a data reduction pool. Asking anyway
-    # would spend a request to learn nothing.
+    # lssevdiskcopy leaves used/real blank on a DRP, so it is not called.
+    # 9.2 lsvolume physical_used is already in $lsvol from the pool list.
+    # Without those rows the panel keeps the explicit unavailable reason.
     if (($poolinfo->{data_reduction} // '') eq 'yes') {
-        return { available => 0, reason => 'data-reduction-pool' };
+        my $map = _lsvolume_fill_view($lsvol);
+        if (!$map->{usable}) {
+            return { available => 0, reason => 'data-reduction-pool' };
+        }
+        my $hits = _apply_fill($vols, $map);
+        return { available => 1, copies => $map->{copies}, measured => $hits };
     }
     my $key = "fill:$pool";
     my $rows = _section($errors, $key, $deadline, 6, sub {
@@ -763,10 +787,10 @@ sub _collect_health {
     # For the list sections an empty REST body means "no rows" (the plugin's
     # _cmd returns undef for empty bodies): render an explicit zero, and only
     # omit the section when its call actually failed.
+    my $lsvol;
     my $vdisks = _section($errors, 'volumes', $deadline, 10, sub {
-        PVE::Storage::Custom::FlashSystemPlugin::_cmd($scfg, 'lsvdisk', undef,
-            { filtervalue => "mdisk_grp_name=$scfg->{fspool}", bytes => JSON::true },
-            storeid => $storeid);
+        PVE::Storage::Custom::FlashSystemPlugin::_list_pool_volumes(
+            $scfg, $storeid, $scfg->{fspool}, rich => 1, lsvolume => \$lsvol);
     });
     if (!exists $errors->{volumes}) {
         $health->{volumes} = _volumes_view($vdisks // [], $scfg);
@@ -776,7 +800,7 @@ sub _collect_health {
         my $top = _top_volumes_view($vdisks // [], $peers,
             limit => 10, self => $storeid);
         $top->{fill} = _collect_fill($scfg, $storeid, $scfg->{fspool}, $pool,
-            $top->{volumes}, $errors, $deadline);
+            $top->{volumes}, $errors, $deadline, $lsvol);
         $health->{top} = $top;
     }
 
@@ -977,10 +1001,10 @@ sub _collect_overview {
         });
         $entry->{capacity} = _pool_view($g) if $g;
 
+        my $lsvol;
         my $vdisks = _section($errors, "volumes:$pool", $deadline, 8, sub {
-            _fscmd($scfg, 'lsvdisk', undef,
-                { filtervalue => "mdisk_grp_name=$pool", bytes => JSON::true },
-                storeid => $storeid);
+            PVE::Storage::Custom::FlashSystemPlugin::_list_pool_volumes(
+                $scfg, $storeid, $pool, rich => 1, lsvolume => \$lsvol);
         });
         # A failed or skipped lsvdisk must NOT publish zeros: "0 volumes"
         # beside real capacity reads as an empty pool, not as missing data.
@@ -995,7 +1019,7 @@ sub _collect_overview {
             my $top = _top_volumes_view($vdisks // [], $by_pool{$pool},
                 limit => 10, foreign_names => $opt{foreign_names});
             $top->{fill} = _collect_fill($scfg, $storeid, $pool, $g,
-                $top->{volumes}, $errors, $deadline);
+                $top->{volumes}, $errors, $deadline, $lsvol);
             $entry->{top} = $top;
         }
 

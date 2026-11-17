@@ -62,7 +62,7 @@ regression tests (`tests/t_names.pl`).
 
 `alloc_image` additionally enforces the Storage Virtualize 63-character
 object-name cap with an actionable error (prefix + volname budget) instead of
-letting `mkvdisk` fail with an opaque CMMVC. The budget is real: a 14-char
+letting the create command fail with an opaque CMMVC. The budget is real: a 14-char
 prefix plus the 48-char CSI name shape is exactly 63.
 
 ## 1d. 429 retry + per-cycle status cache
@@ -80,6 +80,10 @@ storage. Cache-hit and cached-failure paths are unit-tested by seeding the
 cache (`tests/t_status.pl`).
 
 ## 1e. Optional thin provisioning (`fsthin`)
+
+**Current fork:** new volumes use `mkvolume` only. `fsthin 1` adds
+`-thin`, omitted when the pool has a provisioning policy. The `mkvdisk
+-rsize` path below is the pre-9.1 mechanism and has been removed.
 
 Bare `mkvdisk` creates FULLY ALLOCATED volumes — confirmed live 2026-08-25
 via `lsvdisk` (`capacity` == `real_capacity`) — which reserves the full
@@ -390,8 +394,8 @@ The denominator depends on `autoexpand`, and inverting it inverts the
 meaning of the bar. With autoexpand **on**, `real_capacity` grows on demand
 and the fill is `used / provisioned`. With it **off** there is no growth and
 the fill is `used / real_capacity` — reaching 100% there takes the volume
-**offline**. This mirrors IBM's own `-warning` semantics on
-`mkvdisk`/`addvdiskcopy`, and the panel labels which basis it used.
+**offline**. This mirrors IBM's volume `-warning` semantics, and the panel
+labels which basis it used.
 
 **Data reduction pools report no per-volume fill at all.** IBM documents
 `used_capacity`, `real_capacity` and `free_capacity` as blank for thin and

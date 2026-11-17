@@ -11,10 +11,10 @@ section 3. Still open within this item:
 
 - **Field validation across firmwares**: the events/ports/statistics sections
   use whitelist extraction, so unknown field names degrade to empty sections —
-  they need confirming per firmware (8.7 confirmed on 8.7.0.3; 9.x unknown).
-  Note `iser_io`/`iser_mb` exist at 8.7.0 and are **removed** at 9.1.0, and
-  `nvme_*` are absent before 8.4 — treat the statistic list as a set to
-  intersect at runtime, never a fixed schema.
+  they need confirming on 9.1 and 9.2. The last hardware check of the
+  whitelist was 8.7.0.3, before the support floor moved. `iser_io`/`iser_mb`
+  were **removed** at 9.1.0, so a 9.1+ plugin must not require them. Treat
+  the statistic list as a set to intersect at runtime, never a fixed schema.
 - **Not yet validated on hardware**: the datacenter panel as a whole, the
   performance endpoint, and per-volume fill. The storage tab's original
   sections are validated (8.7.0.3); everything added since has unit coverage
@@ -26,18 +26,15 @@ section 3. Still open within this item:
   latency chart at the same moment. (3) does the `lseventlog` alert filter
   actually apply, or is it silently ignored (the code detects the latter, but
   confirm which path ran).
-- **Mirrored volumes are missed**: `lsvdisk` is filtered server-side on
-  `mdisk_grp_name`, which reports `many` for mirrored volumes, so they fall
-  out of pool counts and rankings. The fix is an unfiltered fetch scoped
-  client-side on `parent_mdisk_grp_name`; it changes production-validated
-  counting behaviour, so it wants its own change and its own validation.
-- **Per-volume fill in data reduction pools**: IBM reports the
-  `lssevdiskcopy` capacity fields as blank in a DRP, and the only documented
-  alternative — `used_capacity_before_reduction` — is detailed-view only,
-  i.e. one serialised call per volume. Worth offering as an explicit
-  on-demand drill-down for a single volume; never as part of the always-on
-  view. This matters wherever every tier is a DRP, which was the case
-  on the cluster this was validated against.
+- **Mirrored / HA volumes**: `lsvdisk` filtered on `mdisk_grp_name` misses
+  rows whose pool is `many`. The health and overview lists now append
+  `lsvolume` rows (9.2, `local_pool_name`) that `lsvdisk` did not return.
+  Still needs a hardware check. Pre-9.2 arrays have no `lsvolume`, so
+  mirrored volumes there are still missed.
+- **Per-volume fill in data reduction pools**: `lssevdiskcopy` is still
+  skipped (those fields are blank). On 9.2 the same pool list's `lsvolume`
+  `physical_used` is drawn against provisioned size. Arrays without
+  `physical_used` keep the "fill unavailable" note. Not hardware-validated.
 - **More sections once validated**: `lsenclosurebattery`, drive summary,
   reduction-savings figures, `lsvdiskprogress` / `lsvdisksyncprogress` (a
   volume actively formatting or resyncing explains latency), `lsmdisk`
@@ -56,16 +53,18 @@ section 3. Still open within this item:
 
 ## 2. Thin provisioning refinements
 
-`fsthin` ships (mkvdisk `-rsize 2% -autoexpand -warning 80%`). Open:
-whether `mkvolume` semantics are preferable once IBM's post-DRP guidance is
-clear, and whether rsize/warning deserve per-storage knobs. Also: document a
-tested online thick→thin conversion procedure (`addvdiskcopy -autodelete`).
+`fsthin` sends `mkvolume -thin` and is omitted when the pool has a
+provisioning policy. The pre-9.1 `mkvdisk -rsize` shape is removed. Open:
+confirm `mkvolume -thin` on a 9.1 scratch pool, and document a tested
+online thick→thin conversion (`addvdiskcopy -autodelete`).
 
 ## 3. Firmware 9.x capacity fields
 
-Adapt `_pool_usage()` to whatever 9.x reports (see README open question 2).
-The function is deliberately tiny and fixture-tested — new firmware means new
-fixtures from a real `lsmdiskgrp -bytes`, then the preference logic.
+`_pool_usage()` prefers `physical_*` and falls back to `usable_*` when
+physical is absent. That is fixture-tested, not confirmed against a 9.2
+`lsmdiskgrp -bytes`. A real fixture replaces the guess. Snapshot-buffer
+capacity is not subtracted on its own; if 9.2 already folds it into
+`physical_free_capacity`, no further change is required.
 
 ## 4. TLS CA pinning (`fscafile`)
 

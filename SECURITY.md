@@ -2,9 +2,8 @@
 
 Audit of `FlashSystemPlugin.pm` / `api/FlashSystemAPI.pm` against command
 injection, unsafe host calls, TLS, credential handling, races, retries, and
-Proxmox Perl conventions. Copilot (`mai-code-1.1-flash`) produced a first
-pass; this file is the prioritized report after that pass was reviewed and
-the regressions were fixed.
+Proxmox Perl conventions. A first pass was reviewed and the regressions
+below were fixed.
 
 Status: **implemented in this tree** unless marked residual.
 
@@ -16,9 +15,9 @@ None remaining. The production-proven SCSI resize/taint path is intact.
 
 | ID | Finding | Resolution |
 |---|---|---|
-| H1 | TLS verify was off by default (self-signed array certs). Copilot flipped it on with no escape hatch, which would break every existing 8.7 cluster. | Default is now **verify against the host trust store**. Pin a custom CA with `fscafile`. Lab arrays with a self-signed cert set **`fsinsecure=1`** (one-time warning). |
-| H2 | Copilot’s `_write_sysfs_value` swallowed `$@` and warned internally. `_rescan_paths` / `_flush_device` then reported empty errors — the 2026-08-31 diagnosis (taint vs slow array) would have gone dark again. | Returns `(ok, error)`. Callers put the error in the task log. |
-| H3 | Copilot aborted `_resize_host_device` when &lt;50% of paths accepted the first rescan. That is the opposite of the measured production behaviour (wait; do not thrash). | Early abort **removed**. Incomplete rescans still appear in the final failure message. |
+| H1 | TLS verify was off by default (self-signed array certs). Turning verify on with no escape hatch breaks every array whose management certificate is not in the host trust store. | Default is now **verify against the host trust store**. Pin a custom CA with `fscafile`. Lab arrays with a self-signed cert set **`fsinsecure=1`** (one-time warning). |
+| H2 | An early `_write_sysfs_value` swallowed `$@` and warned internally. `_rescan_paths` / `_flush_device` then reported empty errors — the 2026-08-31 diagnosis (taint vs slow array) would have gone dark again. | Returns `(ok, error)`. Callers put the error in the task log. |
+| H3 | An early `_resize_host_device` aborted when &lt;50% of paths accepted the first rescan. That is the opposite of the measured production behaviour (wait; do not thrash). | Early abort **removed**. Incomplete rescans still appear in the final failure message. |
 | H4 | Transport retry matched `/SSL\|connect/`, so a certificate-verify failure would be retried with sleep and could stall `pvestatd`. | Cert/hostname failures are not retried. Transient connect/reset/DNS/timeout still are. |
 | H5 | Retry helper was off-by-one (`max_attempts => 3` could issue 4 calls) and passed `reauth_done` by value so the flag was dead. Backoff included 8s, which blows `status()`’s 10s alarm. | `max_attempts` is total `$cb` calls. 401/403 re-auth is extra. Backoff is 1/2/4s. |
 
@@ -26,7 +25,7 @@ None remaining. The production-proven SCSI resize/taint path is intact.
 
 | ID | Finding | Resolution |
 |---|---|---|
-| M1 | `fspassword` in `storage.cfg` is still accepted. Copilot warned on **every** `status()` poll. | One-time warning per storage id. Prefer the `.pw` file; add/update hooks still strip the property. |
+| M1 | `fspassword` in `storage.cfg` is still accepted. Warning on **every** `status()` poll floods syslog. | One-time warning per storage id. Prefer the `.pw` file; add/update hooks still strip the property. |
 | M2 | Password file write used a world-readable-umask window. Storage id was not validated before interpolation into a path. | `umask 0077` around the write; storage id must match `[A-Za-z0-9][A-Za-z0-9.\-_]*`. |
 | M3 | Auth JSON parse errors dumped the raw body (can contain a JWT). | Body truncated to 200 chars; JWT-shaped tokens redacted. |
 | M4 | `nvme connect-all --traddr` took `fsnvmeaddr` unchecked. Array-form `run_command` is not a shell, but garbage/newlines should still die. | `_valid_nvme_addr`; port 1–65535; NQN charset check. |

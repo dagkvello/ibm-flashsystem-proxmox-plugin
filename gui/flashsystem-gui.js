@@ -31,7 +31,7 @@ Ext.define('PVE.storage.FlashSystemInputPanel', {
         if (values.fsiogrp?.length === 0) {
             delete values.fsiogrp;
         }
-        ['fsnvmeaddr', 'fsnvmesubnqn', 'fscafile', 'fsvolumegroup', 'fscreate'].forEach((k) => {
+        ['fsnvmeaddr', 'fsnvmesubnqn', 'fscafile', 'fsvolumegroup'].forEach((k) => {
             if (values[k]?.length === 0) {
                 delete values[k];
             }
@@ -144,9 +144,8 @@ Ext.define('PVE.storage.FlashSystemInputPanel', {
                 boxLabel: gettext('enable (validate firmware first)'),
             },
             {
-                // Thin-provision NEW volumes via mkvolume -thin (or mkvdisk
-                // -rsize if Create command is mkvdisk). Ignored when the pool
-                // already has a provisioning policy — the policy wins.
+                // Thin-provision NEW volumes via mkvolume -thin. Ignored when
+                // the pool already has a provisioning policy — the policy wins.
                 xtype: 'proxmoxcheckbox',
                 name: 'fsthin',
                 uncheckedValue: 0,
@@ -176,16 +175,6 @@ Ext.define('PVE.storage.FlashSystemInputPanel', {
         ];
 
         me.advancedColumn2 = [
-            {
-                xtype: me.isCreate ? 'proxmoxKVComboBox' : 'displayfield',
-                name: 'fscreate',
-                fieldLabel: gettext('Create command'),
-                value: 'mkvolume',
-                comboItems: [
-                    ['mkvolume', 'mkvolume (9.x / provisioning policy)'],
-                    ['mkvdisk', 'mkvdisk (8.7 compatible)'],
-                ],
-            },
             {
                 xtype: 'textfield',
                 name: 'fsvolumegroup',
@@ -923,7 +912,7 @@ Ext.define('PVE.FlashSystemUI', {
 
         // Two things the reader has to know to trust these numbers.
         //
-        // The unit: IBM's own 8.7 documentation contradicts itself on the
+        // The unit: IBM's statistic documentation contradicts itself on the
         // *_ms statistics - the stat_name descriptions say microseconds, the
         // attribute table reads as milliseconds, and the Performance
         // statistics page says the CLI always shows microseconds. Guessing

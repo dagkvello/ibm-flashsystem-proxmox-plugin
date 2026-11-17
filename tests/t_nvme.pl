@@ -30,7 +30,7 @@ my $NTT = \&PVE::Storage::Custom::FlashSystemPlugin::_nvme_trtype;
 my $CAND = \&PVE::Storage::Custom::FlashSystemPlugin::_nvme_id_candidates;
 my $UID = \&PVE::Storage::Custom::FlashSystemPlugin::_uid_hex;
 my $POL = \&PVE::Storage::Custom::FlashSystemPlugin::_pool_has_policy;
-my $CC  = \&PVE::Storage::Custom::FlashSystemPlugin::_create_cmd;
+my $RJ  = \&PVE::Storage::Custom::FlashSystemPlugin::_reject_legacy_create;
 my $MKV = \&PVE::Storage::Custom::FlashSystemPlugin::_mkvolume_params;
 
 # ---- transport --------------------------------------------------------------
@@ -63,8 +63,12 @@ ok_case('policy by name',
     $POL->({ provisioning_policy_name => 'thin-std' }) ? 'yes' : 'no', 'yes');
 ok_case('policy none is absent',
     $POL->({ provisioning_policy_name => 'none' }) ? 'yes' : 'no', 'no');
-ok_case('create default mkvolume', $CC->({}), 'mkvolume');
-ok_case('create mkvdisk override', $CC->({ fscreate => 'mkvdisk' }), 'mkvdisk');
+eval { $RJ->({}) };
+ok_case('fscreate absent ok', $@ ? 'died' : 'ok', 'ok');
+eval { $RJ->({ fscreate => ' mkvolume ' }) };
+ok_case('fscreate mkvolume ok', $@ ? 'died' : 'ok', 'ok');
+eval { $RJ->({ fscreate => 'mkvdisk' }) };
+ok_case('fscreate mkvdisk rejected', ($@ && $@ =~ /not supported/) ? 'yes' : 'no', 'yes');
 
 my $vol = $MKV->({ fspool => 'P', fsthin => 1 }, 'pre-vm-1-disk-0', 1048576, 0);
 ok_case('mkvolume pool field', $vol->{pool}, 'P');

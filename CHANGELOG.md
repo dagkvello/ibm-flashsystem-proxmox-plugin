@@ -3,9 +3,53 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Storage Virtualize 9.2.0 — 2026-11-17 (not hardware-validated)
+
+Code changes from the 9.2.0 command reference (GA 27 Nov 2026, LTS). Not run
+on a 9.2 array.
+
+- **Mutations are not replayed** after a lost response or HTTP 5xx.
+  `expandvdisksize` is a delta; a retry grows the volume a second time and
+  PVE will not shrink it. HTTP 429 is still retried (the throttle rejects
+  the command before the CLI runs). Reads still retry transport errors.
+  A synthetic HTTP 500 whose body is `timeout` or a certificate failure is
+  not retried, including on reads.
+- **`lsvolume` for pool membership.** `lsvdisk -filtervalue mdisk_grp_name=`
+  drops volumes whose pool field is `many` (mirrored, some HA). When
+  `lsvolume` exists, `list_images` uses it (`local_pool_name`, `size`).
+  The health and overview lists keep the `lsvdisk` rows and append names
+  only `lsvolume` could see. A missing `lsvolume` (9.1) is remembered and
+  the `lsvdisk` filter stays. Auth and transport failures are not treated
+  as "command missing".
+- **Snapshots address objects by name or UUID.** `addsnapshot` /
+  `restorefromsnapshot` send the volume name. Rollback and delete prefer
+  `snapshot_uuid` and fall back to the numeric id so 9.1 loose-volume
+  delete still satisfies `CMMVC5707E`. If the volume is in a volume group
+  and the snapshot command fails, the error names the group and does not
+  fall back to `addsnapshot -volumegroup` of a shared `fsvolumegroup`.
+- **DRP per-volume fill** uses `lsvolume` `physical_used` against the
+  host-visible size when that list was already fetched. Pools without
+  `physical_used` still report fill unavailable instead of an empty bar.
+  `lssevdiskcopy` is still not called on a data reduction pool.
+- **Supported floor is Storage Virtualize 9.1.** The `mkvdisk` create path
+  is gone. New volumes use `mkvolume` only (`-thin` when `fsthin` is set
+  and the pool has no provisioning policy). `fscreate` is obsolete: leave
+  it unset or set to `mkvolume`; any other value is rejected at create
+  time. Delete the line from `storage.cfg` when you next edit the storage.
+  The property stays in the schema so a file that still contains it keeps
+  loading.
+
+9.2 behaviors that do **not** need plugin code: snapshot buffer on
+`mkvolume` into an existing group, non-partition synchronous DR, HA plus a
+third-site sync copy, NVMe/RDMA MTU 9000, FPIN / Ethernet error counters,
+automatic async compression, and the removal of legacy FlashCopy after this
+release. The plugin already uses the Snapshot function, omits `-thin` on a
+provisioning policy, and refuses shrink. Failover orchestration is still
+out of scope (`PBR.md`).
+
 ## Security review — 2026-09-21
 
-Copilot pass reviewed and corrected. See `SECURITY.md`.
+See `SECURITY.md`.
 
 - TLS verify on by default; `fsinsecure=1` for self-signed lab arrays.
 - Sysfs helpers return the error string (do not swallow `$@`).
@@ -24,7 +68,8 @@ See `LOCAL.md` and `PBR.md`.
   early. Token cache is per `(address, user)`.
 - **`mkvolume` default:** new volumes use `mkvolume` (`pool`, optional
   `-thin`, optional `volumegroup`). `-thin` is omitted when `lsmdiskgrp`
-  reports a provisioning policy. `fscreate=mkvdisk` keeps the 8.7 path.
+  reports a provisioning policy. The later 9.1 floor removed the
+  `fscreate=mkvdisk` alternative.
 - **Capacity:** `_pool_usage` falls back to 9.x `usable_*` when
   `physical_*` is absent.
 - **API 14/15:** `api()` clamped to 15; `volume_resize` dies on `$snapname`;

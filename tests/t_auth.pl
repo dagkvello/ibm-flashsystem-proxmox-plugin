@@ -125,6 +125,92 @@ ok_case('backoff never 8s', $RD->(undef, 3), 4);
     );
     ok_case('http 429 retried to 200', ($got && $got->code == 200 ? 'yes' : 'no'), 'yes');
     ok_case('http 429 attempts', $n, 3);
+
+    $n = 0;
+    $got = PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+        sub { $n++; return FakeRes->new($n < 3 ? 429 : 200); },
+        max_attempts => 3,
+        idempotent => 0,
+    );
+    ok_case('mutation 429 still retried', ($got && $got->code == 200 ? 'yes' : 'no'), 'yes');
+    ok_case('mutation 429 attempts', $n, 3);
+
+    $n = 0;
+    $got = PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+        sub { $n++; return FakeRes->new(500); },
+        max_attempts => 3,
+        idempotent => 0,
+    );
+    ok_case('mutation 500 not retried', $n, 1);
+    ok_case('mutation 500 returned', ($got && $got->code == 500 ? 'yes' : 'no'), 'yes');
+}
+
+{
+    package FakeBody;
+    sub new { my ($c, %h) = @_; bless \%h, $c }
+    sub can { return 1 if $_[1] =~ /\A(?:code|header|decoded_content|status_line)\z/; return }
+    sub code { $_[0]{code} }
+    sub header { return $_[0]{headers}{ $_[1] } }
+    sub decoded_content { $_[0]{body} // '' }
+    sub status_line { $_[0]{status} // $_[0]{code} }
+}
+{
+    no warnings 'redefine';
+    local *PVE::Storage::Custom::FlashSystemPlugin::_sleep = sub { };
+    my $n = 0;
+    eval {
+        PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+            sub { $n++; die "Connection refused\n"; },
+            max_attempts => 3,
+            idempotent => 0,
+        );
+    };
+    ok_case('mutation transport not retried', $n, 1);
+    ok_case('mutation transport dies', ($@ =~ /Connection refused/ ? 'yes' : "no:$@"), 'yes');
+
+    $n = 0;
+    my $got = PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+        sub {
+            $n++;
+            return FakeBody->new(code => 500, body => "certificate verify failed\n",
+                status => '500 certificate verify failed');
+        },
+        max_attempts => 3,
+    );
+    ok_case('cert 500 is one attempt', $n, 1);
+    ok_case('cert 500 returned', ($got && $got->code == 500 ? 'yes' : 'no'), 'yes');
+
+    $n = 0;
+    $got = PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+        sub { $n++; return FakeBody->new(code => 500, body => "timeout\n", status => '500'); },
+        max_attempts => 3,
+    );
+    ok_case('alarm timeout 500 is one attempt', $n, 1);
+
+    $n = 0;
+    $got = PVE::Storage::Custom::FlashSystemPlugin::_request_with_retry(
+        sub {
+            $n++;
+            return FakeBody->new(code => 500, body => "read timed out\n") if $n < 2;
+            return FakeBody->new(code => 200, body => 'ok');
+        },
+        max_attempts => 3,
+    );
+    ok_case('read timeout 500 still retried', ($got && $got->code == 200 ? 'yes' : 'no'), 'yes');
+    ok_case('read timeout 500 attempts', $n, 2);
+}
+
+{
+    my $REFH = \&PVE::Storage::Custom::FlashSystemPlugin::_snapshot_ref;
+    ok_case('snapshot ref prefers uuid',
+        $REFH->({ snapshot_id => '4', snapshot_uuid => 'abc-def' }), 'abc-def');
+    ok_case('snapshot ref keeps numeric id',
+        $REFH->({ snapshot_id => '4', snapshot_uuid => '9' }), '4');
+    my $VG = \&PVE::Storage::Custom::FlashSystemPlugin::_volume_group_label;
+    ok_case('volume group name',
+        $VG->({ volume_group_name => 'vg1' }, {}), 'vg1');
+    ok_case('volume group absent',
+        $VG->({ volume_group_name => '' }, { fsvolumegroup => 'vg1' }), undef);
 }
 
 print $fail ? "\n$fail FAILURE(S)\n" : "\nall auth cases pass\n";

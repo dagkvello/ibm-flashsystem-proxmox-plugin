@@ -468,6 +468,7 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
         }
         return [] if $command eq 'lsportfc';
         return { name => 'demo', code_level => '8.7.0.3' } if $command eq 'lssystem';
+        die "CMMVC7205E The command is not recognized\n" if $command eq 'lsvolume';
         return [] if $command eq 'lsvdisk';
         return [] if $command eq 'lssevdiskcopy';
         return { name => 'P1', status => 'online', data_reduction => 'no',
@@ -499,6 +500,7 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
     local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
         my ($scfg, $command) = @_;
         push @seen, $command;
+        die "CMMVC7205E The command is not recognized\n" if $command eq 'lsvolume';
         return [] if $command =~ /\A(?:lseventlog|lsportfc|lsvdisk|lssevdiskcopy)\z/;
         return { name => 'demo' } if $command eq 'lssystem';
         return { name => 'P1', status => 'online', data_reduction => 'yes',
@@ -514,6 +516,54 @@ ok_case('events: total restored when filter ignored', $ignored->{unfixed_total},
         $ov->{pools}[0]{top}{fill}{reason}, 'data-reduction-pool');
     ok_case('drp: fill marked unavailable',
         $ov->{pools}[0]{top}{fill}{available}, 0);
+}
+
+# ---- 9.2: lsvolume sees HA volumes lsvdisk calls "many", and fills a DRP ----
+{
+    no warnings 'redefine';
+    %PVE::Storage::Custom::FlashSystemPlugin::LSVOLUME_UNSUPPORTED = ();
+    my @seen;
+    local *PVE::Storage::Custom::FlashSystemPlugin::_cmd = sub {
+        my ($scfg, $command) = @_;
+        push @seen, $command;
+        die "CMMVC7205E The command is not recognized\n" if $command eq 'lseventlog';
+        return [] if $command eq 'lsportfc';
+        return { name => 'demo' } if $command eq 'lssystem';
+        return [
+            { name => 'p-vm-1-disk-0', capacity => '1000', status => 'online', se_copy_count => '0' },
+        ] if $command eq 'lsvdisk';
+        return [
+            { name => 'p-vm-1-disk-0', size => '1000', physical_used => '250',
+              local_pool_name => 'P1' },
+            { name => 'p-vm-2-disk-0', size => '800', physical_used => '100',
+              local_pool_name => 'P1' },
+        ] if $command eq 'lsvolume';
+        return { name => 'P1', status => 'online', data_reduction => 'yes',
+                 capacity => '100', free_capacity => '40',
+                 physical_capacity => '100', physical_free_capacity => '40' };
+    };
+    my $peer = [ 'S', { fsaddress => 'nine', fspool => 'P1', fsprefix => 'p' } ];
+    my $ov = PVE::API2::FlashSystem::_collect_overview('S', $peer->[1], [ $peer ]);
+    ok_case('9.2: lssevdiskcopy not used on DRP',
+        (grep { $_ eq 'lssevdiskcopy' } @seen) ? 'queried' : 'skipped', 'skipped');
+    ok_case('9.2: lsvolume consulted',
+        (grep { $_ eq 'lsvolume' } @seen) ? 'yes' : 'no', 'yes');
+    ok_case('9.2: HA volume joined the pool count',
+        $ov->{pools}[0]{pool_volumes}, 2);
+    ok_case('9.2: DRP fill available',
+        $ov->{pools}[0]{top}{fill}{available}, 1);
+    my ($disk) = grep { ($_->{array_name} // '') eq 'p-vm-1-disk-0' }
+        @{ $ov->{pools}[0]{top}{volumes} // [] };
+    ok_case('9.2: fill is physical_used / provisioned',
+        ($disk && $disk->{fill_pct}), 25);
+
+    @seen = ();
+    my $images = PVE::Storage::Custom::FlashSystemPlugin->list_images(
+        'S', { fsaddress => 'nine', fspool => 'P1', fsprefix => 'p' });
+    ok_case('9.2: list_images count', scalar(@$images), 2);
+    ok_case('9.2: list_images uses size as capacity', $images->[0]{size}, 1000);
+    ok_case('9.2: list_images did not also call lsvdisk',
+        (grep { $_ eq 'lsvdisk' } @seen) ? 'yes' : 'no', 'no');
 }
 
 # ---- end-to-end: performance falls back when lssystemstats is unreachable ----

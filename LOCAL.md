@@ -2,12 +2,25 @@
 
 This directory started as a clone of
 [olemyk/ibm-flashsystem-proxmox-plugin](https://github.com/olemyk/ibm-flashsystem-proxmox-plugin)
-(SCSI-FC, firmware 8.7, PVE 9.2) and adds the changes needed for
-**Proxmox VE 9.2 + IBM FlashSystem 7600 / Storage Virtualize 9.1.3.1**, plus
-NVMe-oF.
+(SCSI-FC, PVE 9.2) and targets **Proxmox VE 9.2 + Storage Virtualize 9.1
+or newer** (FlashSystem 7600 / 9.1.3.1), plus NVMe-oF. Firmware older than
+9.1 is not supported. Create is `mkvolume` only.
 
 The SCSI-FC provision/resize/migrate path is unchanged in behaviour. New
-code paths are unit-tested; they are **not** hardware-validated on a 7600.
+code paths are unit-tested; they are **not** hardware-validated on a 7600
+or on 9.2.0.
+
+## 9.2.0 (LTS, GA 27 Nov 2026)
+
+| Change | Where |
+|---|---|
+| Do not retry `expandvdisksize` / `mkvolume` / `rmvdisk` / snapshot commands after transport loss or HTTP 5xx. 429 still retries | `_cmd`, `_request_with_retry` |
+| `lsvolume` (`local_pool_name`) when `lsvdisk` would say `mdisk_grp_name=many` | `_list_pool_volumes`, health and overview |
+| Snapshot parameters are the volume name and, when present, the snapshot UUID | `volume_snapshot`, `_snapshot_ref` |
+| A failed snapshot of a volume-group member names the group and does not snapshot the shared group | `volume_snapshot` |
+| DRP fill from `lsvolume` `physical_used` when that list was already fetched | `_collect_fill` |
+
+Documented only, no new REST: snapshot buffer, non-partition sync DR, HA plus third-site sync, NVMe/RDMA jumbo frames, FPIN. Stay on `addsnapshot`. Do not add failover.
 
 ## Must
 
@@ -38,8 +51,7 @@ code paths are unit-tested; they are **not** hardware-validated on a 7600.
 | `nvme connect-all` using `fsnvmeaddr` | `_nvme_connect` |
 | NVMe resize via controller rescan (no dm-multipath) | `_resize_nvme_device` |
 | `fsvolumegroup` on `mkvolume`; delete errors name the group | `_mkvolume_params`, `free_image` |
-
-Keep `fscreate=mkvdisk` if you need the exact 8.7 `mkvdisk -rsize` path.
+| `fscreate` other than unset/`mkvolume` is rejected. The `mkvdisk` create path is removed | `_reject_legacy_create` |
 
 ## What was not rewritten
 
