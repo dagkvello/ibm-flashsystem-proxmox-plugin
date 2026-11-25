@@ -10,6 +10,18 @@ The SCSI-FC provision/resize/migrate path is unchanged in behaviour. New
 code paths are unit-tested; they are **not** hardware-validated on a 7600
 or on 9.2.0.
 
+## Proxmox VE 9.3 (storage API 17)
+
+| Change | Where |
+|---|---|
+| Schema titles, display name, advanced and hidden fields for the generated Add dialog | `properties`, `plugindata` |
+| `isolate-properties` only when the host API is 17 or newer | `plugindata` |
+| `parse_volname` returns `vm-vol` / `vm-state` on API 17, `images` before that | `_guest_vtype` |
+| Declared format is raw only | `plugindata` |
+| Password file removed on storage delete, and when an edit clears it | `on_delete_hook`, `on_update_hook_full` |
+
+The SAN view, cluster multipath wizard, and volume-chain snapshots are LVM features in Proxmox. This plugin does not implement them.
+
 ## 9.2.0 (LTS, GA 27 Nov 2026)
 
 | Change | Where |

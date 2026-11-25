@@ -18,13 +18,14 @@ in [CHANGELOG.md](CHANGELOG.md) and the code comments.
 
 ## Status
 
-Supported floor: **Storage Virtualize 9.1** and Proxmox VE 9.2. New volumes
-are created with `mkvolume` only. Firmware older than 9.1 is not a target.
+Supported floor: **Storage Virtualize 9.1** and Proxmox VE 9.2. Proxmox VE
+9.3 is tracked (storage API 17). New volumes are created with `mkvolume`
+only. Firmware older than 9.1 is not a target.
 
 | Component | Version |
 |---|---|
 | IBM Storage Virtualize firmware | 9.1 or newer (9.2.0 tracked, not hardware-validated) |
-| Proxmox VE | 9.2 |
+| Proxmox VE | 9.2, or 9.3 (schema dialog and guest volume types; not hardware-validated) |
 | Transport | SCSI-FC (default), or NVMe-oF on FC / TCP / RDMA |
 | Kubernetes | via proxmox-csi (`vm-9999-pvc-<uuid>` volumes) |
 
@@ -41,6 +42,11 @@ replay of `expandvdisksize` after a lost response, `lsvolume` when a pool
 field is `many`, and snapshot name/UUID for a partition management IP.
 Those paths are unit-tested; they are **not** yet validated on a
 FlashSystem 7600 / 9.1.3.1 or on 9.2.0. Use a scratch pool first.
+
+On Proxmox VE 9.3 the Add menu builds the FlashSystem dialog from this
+plugin's schema (`title`, advanced fields, hidden `fscreate`). The health
+tab still comes from `gui/flashsystem-gui.js`. The Datacenter SAN view and
+"snapshots as volume chains" belong to shared LVM, not to this plugin.
 
 **Not supported:** templates / linked clones (no base-image support — keep
 template VMs on LVM or dir storage; full clones *onto* this storage work),

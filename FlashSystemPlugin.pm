@@ -49,11 +49,16 @@ use PVE::Storage::Plugin;
 use base qw(PVE::Storage::Plugin);
 
 use constant REST_PORT => 7443;
-# Last storage-plugin API version this module actually implements
-# (qemu_blockdev_options/volume_qemu_snapshot_method via the base class,
-# get_identity, volume_resize $snapname, rename_volume). Hosts newer than
-# this still load us; we do not claim APIVER we have not coded against.
-use constant PLUGIN_APIVER_MAX => 15;
+# Last storage-plugin API version this module actually implements.
+# Through 15: qemu_blockdev_options and volume_qemu_snapshot_method via the
+# base class, get_identity, volume_resize $snapname, rename_volume.
+# 17: guest volume types (vm-vol / vm-state), schema titles for the generated
+# Add dialog, and isolate-properties. Hosts newer than this still load us;
+# we do not claim an APIVER we have not coded against.
+use constant PLUGIN_APIVER_MAX => 17;
+# Tests set this to exercise the 9.3 (API 17) volume types without the
+# host constant. Left unset, the real PVE::Storage::APIVER is used.
+our $APIVER_OVERRIDE;
 # Refresh a JWT this many seconds before `exp`.
 use constant JWT_REFRESH_SKEW => 60;
 
@@ -88,63 +93,106 @@ use constant JWT_REFRESH_SKEW => 60;
 
 sub type { return 'flashsystem'; }
 
+# Host storage API. The test suite's stub is 15; Proxmox VE 9.3 is 17.
+sub _host_apiver {
+    return $APIVER_OVERRIDE if defined $APIVER_OVERRIDE;
+    my $v = eval { PVE::Storage::APIVER() };
+    return 0 if !defined $v || $v !~ /\A\d+\z/;
+    return $v + 0;
+}
+
 # Clamp to the newest API this plugin implements. Claiming the host's APIVER
 # blindly would silence the "older API" warning while skipping new methods.
 sub api {
-    my $host = eval { PVE::Storage::APIVER } // 11;
+    my $host = _host_apiver() || 11;
     return $host < PLUGIN_APIVER_MAX ? $host : PLUGIN_APIVER_MAX;
 }
 
 sub plugindata {
-    # Block devices for VM disk images / CT root disks only.
+    # Block devices for VM disk images / CT root disks only. raw is the only
+    # format; declaring it keeps the 9.3 generated dialog from offering qcow2.
     # fspassword is sensitive so PVE keeps it out of storage.cfg when the
     # add/update hooks run (falls back to the .pw file either way).
-    return {
-        content => [ { images => 1, rootdir => 1 }, { images => 1 } ],
+    my $content = { images => 1, rootdir => 1 };
+    my $pd = {
+        content => [ $content, { images => 1 } ],
+        format => [ { raw => 1 }, 'raw' ],
+        meta => { 'display-name' => 'IBM FlashSystem' },
         'sensitive-properties' => { fspassword => 1 },
+        # The generated Add/Edit dialog (PVE 9.3) shows the connection fields
+        # first. These stay one section down.
+        'advanced-properties' => {
+            fsiogrp => 1, fssnapshots => 1, fsthin => 1,
+            fsnvmeaddr => 1, fsnvmeport => 1, fsnvmesubnqn => 1,
+            fscafile => 1, fsinsecure => 1, fsvolumegroup => 1,
+        },
+        # Obsolete create switch. Still accepted in storage.cfg so an old
+        # line does not unload the storage. Not offered in the dialog.
+        'hidden-properties' => { fscreate => 1 },
     };
+    if (_host_apiver() >= 17) {
+        # API 17: a storage can be limited to VM disks, VM state, or
+        # container volumes. images/rootdir still allow all of them.
+        $content->{'vm-vol'} = 1;
+        $content->{'vm-state'} = 1;
+        $content->{'ct-vol'} = 1;
+        # Own property names cannot collide with a later in-tree plugin.
+        # Only set this on API 17; an older host refuses the key.
+        $pd->{'isolate-properties'} = 1;
+    }
+    return $pd;
 }
 
 sub properties {
+    # title is the label of the dialog Proxmox VE 9.3 generates from this
+    # schema. Older releases ignore it.
     return {
-        fsaddress => { description => 'FlashSystem management IP/host', type => 'string' },
-        fsuser    => { description => 'Storage Virtualize REST username', type => 'string' },
-        fspassword => { description => 'REST password (prefer the .pw file, see README)', type => 'string' },
-        fspool    => { description => 'Storage pool (mdiskgrp) to allocate from', type => 'string' },
-        fshostgroup => { description => 'Host cluster the Proxmox nodes belong to', type => 'string' },
-        fsiogrp   => { description => 'I/O group for new vdisks (default io_grp0)', type => 'string' },
-        fssnapshots => { description => 'Enable array snapshots (validate firmware first)', type => 'boolean' },
-        fsprefix  => { description => 'Prefix for array-side object names, e.g. the cluster name. Required when several clusters share a pool.', type => 'string' },
-        fsthin    => { description => 'Thin-provision new volumes (mkvolume -thin). Ignored when the pool already has a provisioning policy.', type => 'boolean' },
+        fsaddress => { title => 'Management address', description => 'FlashSystem management IP/host', type => 'string' },
+        fsuser    => { title => 'REST username', description => 'Storage Virtualize REST username', type => 'string' },
+        fspassword => { title => 'REST password', description => 'REST password (prefer the .pw file, see README)', type => 'string' },
+        fspool    => { title => 'Pool', description => 'Storage pool (mdiskgrp) to allocate from', type => 'string' },
+        fshostgroup => { title => 'Host cluster', description => 'Host cluster the Proxmox nodes belong to', type => 'string' },
+        fsiogrp   => { title => 'I/O group', description => 'I/O group for new vdisks (default io_grp0)', type => 'string' },
+        fssnapshots => { title => 'Array snapshots', description => 'Enable array snapshots (validate firmware first)', type => 'boolean' },
+        fsprefix  => { title => 'Prefix', description => 'Prefix for array-side object names, e.g. the cluster name. Required when several clusters share a pool.', type => 'string' },
+        fsthin    => { title => 'Thin provisioning', description => 'Thin-provision new volumes (mkvolume -thin). Ignored when the pool already has a provisioning policy.', type => 'boolean' },
         fstransport => {
+            title => 'Transport',
             description => 'Host transport: scsi-fc (default), nvme-fc, nvme-tcp, nvme-rdma',
             type => 'string',
         },
         fsnvmeaddr => {
+            title => 'NVMe discovery',
             description => 'NVMe-oF discovery addresses (comma-separated). TCP/RDMA: IPs. FC: nn-0xWWNN:pn-0xWWPN pairs.',
             type => 'string',
         },
         fsnvmeport => {
+            title => 'NVMe port',
             description => 'NVMe/TCP or NVMe/RDMA discovery port (default 4420)',
             type => 'integer',
         },
         fsnvmesubnqn => {
+            title => 'Subsystem NQN',
             description => 'Optional subsystem NQN. Empty = nvme connect-all discovers it.',
             type => 'string',
         },
         fscafile => {
+            title => 'TLS CA file',
             description => 'PEM CA bundle for the array management certificate. Unset = verify against the host trust store (secure default).',
             type => 'string',
         },
         fsinsecure => {
+            title => 'Insecure TLS',
             description => 'Disable TLS certificate verification. Self-signed lab arrays only; logs a one-time warning.',
             type => 'boolean',
         },
         fscreate => {
+            title => 'Create command',
             description => 'Obsolete. Leave unset. Storage Virtualize 9.1 and newer create volumes with mkvolume. Any other value is rejected. Remove this from storage.cfg.',
             type => 'string',
         },
         fsvolumegroup => {
+            title => 'Volume group',
             description => 'Existing array volume group to place new volumes in (PBR/PBHA awareness). Must already exist.',
             type => 'string',
         },
@@ -229,6 +277,39 @@ sub on_update_hook {
     _store_password($storeid, $pw) if defined $pw && length $pw;
     delete $scfg->{fspassword};
     return undef;
+}
+
+# API 13+. Called instead of on_update_hook when the host knows it.
+# A key present in $sensitive is being changed. undef removes it.
+sub on_update_hook_full {
+    my ($class, $storeid, $scfg, $update, $delete, $sensitive) = @_;
+    $sensitive = {} if ref($sensitive) ne 'HASH';
+    if (exists $sensitive->{fspassword}) {
+        my $pw = $sensitive->{fspassword};
+        if (defined $pw && length $pw) {
+            _store_password($storeid, $pw);
+        } else {
+            _forget_password($storeid);
+        }
+    }
+    delete $scfg->{fspassword};
+    return undef;
+}
+
+# Also runs when PVE 9.3 rolls back a new storage whose first activation
+# failed, so the password file from on_add_hook does not stay behind.
+sub on_delete_hook {
+    my ($class, $storeid, $scfg) = @_;
+    _forget_password($storeid);
+    return undef;
+}
+
+sub _forget_password {
+    my ($storeid) = @_;
+    my $file = _pwfile($storeid);
+    return if !defined $file || !-e $file;
+    unlink $file or warn "flashsystem: cannot remove $file: $!\n";
+    return 1;
 }
 
 sub _ua {
@@ -1093,11 +1174,22 @@ sub _resize_failed {
 # trailing newline — both would flow straight into REST URLs and volids.
 our $VOLNAME_SUFFIX = qr/(?:state-[A-Za-z0-9][\w\-.]*|[A-Za-z0-9][\w\-]*)/a;
 
+# API 17 names a guest volume more specifically than images. A host older
+# than that still receives images, which it accepts for every guest volume.
+# Raw container disks use the same vm-<id>-* names as VM disks, so they are
+# vm-vol. vm-state is only the RAM/hibernation volume.
+sub _guest_vtype {
+    my ($volname) = @_;
+    return 'images' if _host_apiver() < 17;
+    return 'vm-state' if $volname =~ /\Avm-\d+-state-/a;
+    return 'vm-vol';
+}
+
 sub parse_volname {
     my ($class, $volname) = @_;
     # ($vtype, $name, $vmid, $basename, $basevmid, $isBase, $format)
     if ($volname =~ m/\A(vm-(\d+)-$VOLNAME_SUFFIX)\z/a) {
-        return ('images', $1, $2, undef, undef, 0, 'raw');
+        return (_guest_vtype($1), $1, $2, undef, undef, 0, 'raw');
     }
     die "flashsystem: unable to parse volume name '$volname'\n";
 }

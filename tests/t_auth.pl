@@ -40,8 +40,8 @@ sub jwt {
 ok_case('api clamps to PLUGIN_APIVER_MAX',
     $P->api() <= PVE::Storage::Custom::FlashSystemPlugin::PLUGIN_APIVER_MAX() ? 'yes' : 'no',
     'yes');
-ok_case('PLUGIN_APIVER_MAX is 15',
-    PVE::Storage::Custom::FlashSystemPlugin::PLUGIN_APIVER_MAX(), 15);
+ok_case('PLUGIN_APIVER_MAX is 17',
+    PVE::Storage::Custom::FlashSystemPlugin::PLUGIN_APIVER_MAX(), 17);
 
 my $EXP = \&PVE::Storage::Custom::FlashSystemPlugin::_jwt_expiry;
 my $REF = \&PVE::Storage::Custom::FlashSystemPlugin::_jwt_needs_refresh;

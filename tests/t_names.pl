@@ -68,6 +68,29 @@ for my $c (
     ok_case("parse $label name", $@ ? '(died)' : $n, $vol);
 }
 
+# API 17 (Proxmox VE 9.3) names guest volumes. The suite stub is API 15,
+# which must keep returning images.
+$PVE::Storage::Custom::FlashSystemPlugin::APIVER_OVERRIDE = 17;
+for my $c (
+    ['disk',    'vm-101-disk-0',     'vm-vol'],
+    ['state',   'vm-101-state-test', 'vm-state'],
+    ['csi pvc', "vm-9999-pvc-$uuid", 'vm-vol'],
+) {
+    my ($label, $vol, $want) = @$c;
+    my ($vt) = eval { $P->parse_volname($vol) };
+    ok_case("parse api17 $label", $@ ? '(died)' : $vt, $want);
+}
+my $pd17 = $P->plugindata();
+ok_case('api17 display name', $pd17->{meta}{'display-name'}, 'IBM FlashSystem');
+ok_case('api17 isolates properties', $pd17->{'isolate-properties'} ? 'yes' : 'no', 'yes');
+ok_case('api17 offers vm-vol', $pd17->{content}[0]{'vm-vol'} ? 'yes' : 'no', 'yes');
+ok_case('api17 default format raw', $pd17->{format}[1], 'raw');
+ok_case('api17 hides fscreate', $pd17->{'hidden-properties'}{fscreate} ? 'yes' : 'no', 'yes');
+$PVE::Storage::Custom::FlashSystemPlugin::APIVER_OVERRIDE = undef;
+my $pd15 = $P->plugindata();
+ok_case('api15 does not isolate', $pd15->{'isolate-properties'} ? 'yes' : 'no', 'no');
+ok_case('api15 keeps images', ($P->parse_volname('vm-101-disk-0'))[0], 'images');
+
 # ---- parse_volname: rejected shapes ----------------------------------------
 for my $c (
     ['empty suffix',   'vm-101-'],

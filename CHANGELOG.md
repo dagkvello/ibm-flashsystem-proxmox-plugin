@@ -3,6 +3,31 @@
 Pre-release history, condensed from internal deployment tags. Dates are when
 the change reached a 12-node production cluster (PVE 9.2, firmware 8.7).
 
+## Proxmox VE 9.3 — 2026-11-25 (not hardware-validated)
+
+Storage plugin API 17, from the 9.3 plugin guide and `ApiChangeLog`. The
+SCSI-FC path is unchanged. Not run on a 9.3 node.
+
+- **Generated Add/Edit dialog.** Each property has a `title`. `plugindata`
+  sets the display name `IBM FlashSystem`, marks thin/snapshot/NVMe/TLS/
+  volume-group fields advanced, and hides the obsolete `fscreate` key.
+  On API 17 the plugin isolates its properties so a later in-tree name
+  cannot unload it. The format list is raw only.
+- **Guest volume types.** `parse_volname` returns `vm-vol` or `vm-state`
+  when the host API is 17 or newer. Older hosts still receive `images`.
+  Content may be restricted to `vm-vol`, `vm-state`, or `ct-vol`.
+- **Password file cleanup.** `on_delete_hook` removes the `.pw` file,
+  including when 9.3 rolls back a new storage whose first activation
+  failed. `on_update_hook_full` replaces or clears the password when the
+  sensitive field is actually changed.
+
+Left to Proxmox itself, not this plugin: the Datacenter SAN view and
+cluster multipath wizard (they manage host LUNs and shared LVM), snapshots
+as volume chains (LVM/file storages), and the new in-tree NVMe-oF storage
+type. This plugin keeps its own SCSI-FC and NVMe-oF mapping and its array
+Snapshot function. The injected `flashsystem-gui.js` is still what adds
+the health tab. On 9.3 the Add menu no longer depends on that injection.
+
 ## Storage Virtualize 9.2.0 — 2026-11-17 (not hardware-validated)
 
 Code changes from the 9.2.0 command reference (GA 27 Nov 2026, LTS). Not run

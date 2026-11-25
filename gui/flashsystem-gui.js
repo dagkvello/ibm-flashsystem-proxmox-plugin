@@ -1,11 +1,12 @@
 // ---------------------------------------------------------------------------
 // GUI add/edit support for the custom `flashsystem` storage type.
 //
-// Proxmox's Datacenter > Storage "Add"/"Edit" dialogs are defined entirely in
-// the pve-manager frontend (pvemanagerlib.js), which has NO plugin API - so a
-// custom backend storage plugin never appears in the "Add" menu and has no
-// edit form. This file fills that gap: it defines an ExtJS input panel and
-// registers the `flashsystem` type in PVE.Utils.storageSchema.
+// On Proxmox VE 9.2 and earlier, Datacenter > Storage "Add"/"Edit" has no
+// plugin API, so a custom storage type never appears. This file fills that
+// gap: an ExtJS input panel registered in PVE.Utils.storageSchema.
+// Proxmox VE 9.3 builds that dialog from the plugin schema instead. The
+// registration below remains for 9.2. The health tab further down is still
+// required on both releases.
 //
 // It is appended to /usr/share/pve-manager/js/pvemanagerlib.js by
 // install-flashsystem-gui.sh, which also installs an APT post-invoke hook to
